@@ -62,6 +62,13 @@ func (d *backend) request(op *operation, path string, query url.Values) (respons
 	if err := op.check(); err != nil {
 		return response{}, err
 	}
+	// A request whose cumulative operation budget is already spent must not
+	// reach the header callback or the network. Without this early refusal a
+	// subsequent physical page could still allocate its per-response probe
+	// after the total budget had been exhausted.
+	if op.bytes >= d.cfg.MaxTotalBytes {
+		return response{}, ErrResponseTooLarge
+	}
 	headers, err := d.requestHeaders(op.ctx)
 	if err != nil {
 		return response{}, err
@@ -98,15 +105,19 @@ func (d *backend) request(op *operation, path string, query url.Values) (respons
 	if limit <= 0 {
 		return response{}, ErrResponseTooLarge
 	}
+	// Never read more than the smaller of the per-response limit and what is
+	// left of the operation's total budget, plus one probe byte to detect an
+	// over-budget body. Reading MaxResponseBytes+1 first would allocate the
+	// whole per-response allowance even when only one total byte remained.
+	if remaining := d.cfg.MaxTotalBytes - op.bytes; remaining < limit {
+		limit = remaining
+	}
 	reader := io.LimitReader(resp.Body, limit+1)
 	body, err := io.ReadAll(reader)
 	if err != nil {
 		return response{}, safeContextError(op.ctx, err)
 	}
 	if int64(len(body)) > limit {
-		return response{}, ErrResponseTooLarge
-	}
-	if op.bytes > d.cfg.MaxTotalBytes-int64(len(body)) {
 		return response{}, ErrResponseTooLarge
 	}
 	op.bytes += int64(len(body))
@@ -124,6 +135,12 @@ func (d *backend) requestHeaders(ctx context.Context) (map[string]string, error)
 	}
 	raw, err := provider(ctx)
 	if err != nil {
+		// A header provider that observes cancellation or a deadline must keep
+		// the canonical context identity; only an unrelated provider failure
+		// is sanitised to ErrHeaderProvider.
+		if canonical := canonicalContextError(ctx, err); canonical != nil {
+			return nil, canonical
+		}
 		return nil, ErrHeaderProvider
 	}
 	headers := make(map[string]string, len(raw)+1)

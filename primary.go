@@ -137,7 +137,7 @@ func (d *backend) lookupIDs(ctx context.Context, ids []string) (map[string]Searc
 	if err != nil {
 		return nil, err
 	}
-	decoded, err := decodeSearchResponse(resp.body, len(ids), false, d.cfg.MaxRowBytes)
+	decoded, err := decodeSearchResponse(resp.body, len(ids), 0, nil, 0, d.cfg.MaxRowBytes)
 	if err != nil {
 		return nil, err
 	}

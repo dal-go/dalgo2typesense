@@ -155,7 +155,15 @@ func (d *backend) Search(ctx context.Context, request SearchRequest) (SearchResu
 	if err != nil {
 		return SearchResult{}, err
 	}
-	decoded, err := decodeSearchResponse(resp.body, request.Limit, len(request.FacetBy) > 0, d.cfg.MaxRowBytes)
+	maxFacetValues := 0
+	if len(request.FacetBy) > 0 {
+		maxFacetValues, err = d.facetLimit(request)
+		if err != nil {
+			return SearchResult{}, err
+		}
+	}
+	decoded, err := decodeSearchResponse(resp.body, request.Limit, request.Offset,
+		request.FacetBy, maxFacetValues, d.cfg.MaxRowBytes)
 	if err != nil {
 		return SearchResult{}, err
 	}
@@ -242,15 +250,9 @@ func (d *backend) nativeQuery(request SearchRequest) (string, url.Values, error)
 	}
 	if len(facets) > 0 {
 		query.Set("facet_by", strings.Join(facets, ","))
-		maxFacetValues := request.MaxFacetValues
-		if maxFacetValues == 0 {
-			maxFacetValues = 10
-			if d.cfg.MaxFacetValues < maxFacetValues {
-				maxFacetValues = d.cfg.MaxFacetValues
-			}
-		}
-		if maxFacetValues < 0 || maxFacetValues > d.cfg.MaxFacetValues {
-			return "", nil, notSupported("max facet values is outside the configured bound")
+		maxFacetValues, err := d.facetLimit(request)
+		if err != nil {
+			return "", nil, err
 		}
 		query.Set("max_facet_values", strconv.Itoa(maxFacetValues))
 	}
@@ -268,6 +270,25 @@ func (d *backend) nativeQuery(request SearchRequest) (string, url.Values, error)
 	}
 	setSearchPolicy(query)
 	return collection, query, nil
+}
+
+// facetLimit returns the effective max_facet_values for one request. A zero
+// caller value means the documented default of 10, but it never exceeds the
+// configured bound. The same value is sent to the server and used to validate
+// the response, so the adapter cannot silently truncate or expose more values
+// than it admitted.
+func (d *backend) facetLimit(request SearchRequest) (int, error) {
+	maxFacetValues := request.MaxFacetValues
+	if maxFacetValues == 0 {
+		maxFacetValues = 10
+		if d.cfg.MaxFacetValues < maxFacetValues {
+			maxFacetValues = d.cfg.MaxFacetValues
+		}
+	}
+	if maxFacetValues < 0 || maxFacetValues > d.cfg.MaxFacetValues {
+		return 0, notSupported("max facet values is outside the configured bound")
+	}
+	return maxFacetValues, nil
 }
 
 func buildSearchResult(collection string, decoded segment, limit, offset int) SearchResult {
@@ -291,7 +312,7 @@ func buildSearchResult(collection string, decoded segment, limit, offset int) Se
 	}
 }
 
-func decodeSearchResponse(payload []byte, limit int, requireFacets bool, maxRowBytes int64) (segment, error) {
+func decodeSearchResponse(payload []byte, limit, offset int, facetFields []string, maxFacetValues int, maxRowBytes int64) (segment, error) {
 	var wire searchWire
 	if err := decodeJSON(payload, &wire); err != nil {
 		return segment{}, err
@@ -356,10 +377,10 @@ func decodeSearchResponse(payload []byte, limit int, requireFacets bool, maxRowB
 		seen[hit.ID] = true
 		hits = append(hits, hit)
 	}
-	if found < len(hits) || outOf < found {
-		return segment{}, malformed("search counts are inconsistent with returned hits")
+	if (len(hits) > 0 && found < offset+len(hits)) || outOf < found {
+		return segment{}, malformed("search counts are inconsistent with the requested offset")
 	}
-	facets, err := decodeFacets(wire.FacetCounts, requireFacets)
+	facets, err := decodeFacets(wire.FacetCounts, facetFields, maxFacetValues)
 	if err != nil {
 		return segment{}, err
 	}
@@ -446,10 +467,16 @@ func requiredInt64(raw json.RawMessage, what string) (int64, error) {
 	return value, nil
 }
 
-func decodeFacets(raw json.RawMessage, required bool) ([]Facet, error) {
+// decodeFacets validates a facet_counts array against the exact bounded facet
+// request. Typesense 30.2 returns one entry for every requested facet, even
+// when that facet has no values, so a missing entry is a truncated or malformed
+// response rather than a legitimate omission. With no requested facets an empty
+// (or absent) array is accepted, while any facet entry is refused instead of
+// being exposed.
+func decodeFacets(raw json.RawMessage, requested []string, maxValues int) ([]Facet, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
-		if required {
+		if len(requested) > 0 {
 			return nil, malformed("facet_counts is missing")
 		}
 		return nil, nil
@@ -458,7 +485,21 @@ func decodeFacets(raw json.RawMessage, required bool) ([]Facet, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(requested) == 0 {
+		if len(entries) > 0 {
+			return nil, malformed("facet_counts was not requested")
+		}
+		return nil, nil
+	}
+	if len(entries) != len(requested) {
+		return nil, malformed("facet_counts does not match the requested facets")
+	}
+	requestedSet := make(map[string]bool, len(requested))
+	for _, field := range requested {
+		requestedSet[field] = true
+	}
 	facets := make([]Facet, 0, len(entries))
+	seenFields := make(map[string]bool, len(entries))
 	for _, entry := range entries {
 		item, err := requiredObject(entry, "facet")
 		if err != nil {
@@ -468,14 +509,22 @@ func decodeFacets(raw json.RawMessage, required bool) ([]Facet, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !validateFieldName(field, true) {
-			return nil, malformed("facet field name is not supported")
+		if !requestedSet[field] {
+			return nil, malformed("facet field was not requested")
 		}
+		if seenFields[field] {
+			return nil, malformed("duplicate facet field")
+		}
+		seenFields[field] = true
 		rawCounts, err := requiredArray(item["counts"], "facet counts")
 		if err != nil {
 			return nil, err
 		}
+		if len(rawCounts) > maxValues {
+			return nil, malformed("facet value count exceeds the requested bound")
+		}
 		facet := Facet{Field: field, Counts: make([]FacetValue, 0, len(rawCounts))}
+		seenValues := make(map[string]bool, len(rawCounts))
 		for _, rawCount := range rawCounts {
 			countItem, err := requiredObject(rawCount, "facet value")
 			if err != nil {
@@ -485,13 +534,20 @@ func decodeFacets(raw json.RawMessage, required bool) ([]Facet, error) {
 			if err != nil {
 				return nil, err
 			}
+			if seenValues[value] {
+				return nil, malformed("duplicate facet value")
+			}
+			seenValues[value] = true
 			count, err := requiredInt(countItem["count"], "facet count")
 			if err != nil {
 				return nil, err
 			}
 			highlighted := ""
 			if rawHighlighted, ok := countItem["highlighted"]; ok {
-				highlighted, _ = requiredString(rawHighlighted, "facet highlighted")
+				highlighted, err = requiredString(rawHighlighted, "facet highlighted")
+				if err != nil {
+					return nil, err
+				}
 			}
 			facet.Counts = append(facet.Counts, FacetValue{Value: value, Count: count, Highlighted: highlighted})
 		}

@@ -143,10 +143,11 @@ func malformed(reason string) error {
 	return fmt.Errorf("%w: %s", ErrMalformedResponse, reason)
 }
 
-// safeContextError maps a transport or reader error to a context sentinel when
-// either the error or the context says the operation was canceled or timed out.
-// Any other error is replaced by the detail-free ErrRequestFailed.
-func safeContextError(ctx context.Context, err error) error {
+// canonicalContextError returns a safe canonical context sentinel when either
+// the supplied error or the context identifies a cancellation or deadline. The
+// original error is never returned: its text may wrap a credential. A nil
+// result means neither source reports a context condition.
+func canonicalContextError(ctx context.Context, err error) error {
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return ErrCanceled
@@ -162,6 +163,16 @@ func safeContextError(ctx context.Context, err error) error {
 			}
 			return ErrDeadlineExceeded
 		}
+	}
+	return nil
+}
+
+// safeContextError maps a transport or reader error to a context sentinel when
+// either the error or the context says the operation was canceled or timed out.
+// Any other error is replaced by the detail-free ErrRequestFailed.
+func safeContextError(ctx context.Context, err error) error {
+	if canonical := canonicalContextError(ctx, err); canonical != nil {
+		return canonical
 	}
 	return ErrRequestFailed
 }
