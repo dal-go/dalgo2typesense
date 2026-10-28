@@ -96,10 +96,18 @@ collections, keys or documents.
 ### Identity and value fidelity
 
 * The native Typesense `id` is always a string. `"001"` and `1` are different.
-* JSON integers are decoded with `UseNumber` and converted without a float64
-  round trip first. Integers that fit `int64` become `int64`; larger
-  non-negative integers that fit `uint64` become `uint64`; other JSON numbers
-  become finite `float64` values. Values outside those classes are rejected.
+* JSON numbers are decoded with `UseNumber` and resolved exactly before any
+  value is exposed. An integral value stays integral even when it is spelled
+  with an exponent or a decimal point: `9007199254740993e0` and
+  `9007199254740993.0` both become exactly `9007199254740993`, not the
+  float64-rounded neighbour. Integers that fit `int64` become `int64`; larger
+  non-negative integers that fit `uint64` become `uint64`. An integral value
+  outside those ranges is rejected, never silently substituted. Only
+  non-integral values become finite `float64` values with documented IEEE754
+  semantics.
+* Facet stats keep the exact native JSON class too: an integral `min`, `max`,
+  `sum` or `avg` is `int64`/`uint64`, a fractional one is `float64`. They stay
+  native Typesense facet statistics, not SQL aggregates.
 * Arrays, objects, booleans, strings and null are not stringified.
 * A projected DALgo query returns exactly its declared columns in declaration
   order. The native identity may be fetched as a helper but never leaks into a
@@ -116,9 +124,17 @@ Typesense accepts at most 250 hits per page. One DALgo query may span several
 pages under one operation deadline, one byte budget and one page budget. `found`
 and `out_of` are server metadata, distinct from `Returned` hits. A short or
 empty page that the server's own `found` count says is not the end returns
-`ErrPartialResult`, so a scoped `limit_hits` or `search_cutoff_ms` is never
-presented as a clean EOF. `search_cutoff_ms` is not a strict bound and facets are
-not bound by it, so the adapter does not send it.
+`ErrPartialResult`, so a scoped `limit_hits` is never presented as a clean EOF.
+An offset at or beyond `found` is a valid empty result and is reported as EOF,
+not as a malformed page.
+
+The adapter also decodes the server's `search_cutoff` response indicator as a
+strict boolean. A cutoff makes a native result explicitly `Partial` with
+`Complete` false, even when the cutoff page returned zero hits and `found` is
+zero. DALgo readers, `Get`, `Exists` and `GetMulti` refuse a cutoff with
+`ErrPartialResult`; it is never mistaken for EOF, a missing document or a full
+result. `search_cutoff_ms` is not a strict bound, facets are not bound by it and
+the adapter does not send it as a hard provider deadline.
 
 No id sort is invented. An explicit application-field sort is the caller's
 choice; repeatable pages are claimed only for unchanged data with a unique sort
@@ -140,6 +156,13 @@ All bounds have modest defaults and hard maxima. Notable defaults:
 | `MaxRowBytes` | 1 MiB | 64 MiB |
 | `Timeout` | 30s | 2m |
 
+`MaxRowsPerPage` is the physical page size of the structured reader and also
+bounds one native search or one exact-id `GetMulti` batch. A larger native
+request is refused before I/O; the configured bound is never silently ignored.
+`MaxRowBytes` is enforced by every read path (native search, structured reader
+and recordset, `Get`, `Exists`, `GetMulti`) before an over-budget document is
+exposed.
+
 Redirects are refused before a credential can reach another origin. The adapter
 copies a caller-supplied `http.Client` and never mutates it. It only closes a
 transport it created. Error values retain a numeric HTTP status and safe
@@ -155,10 +178,14 @@ SDK, and it does not relicense DALgo core or any CLI.
 
 Unit tests use `httptest` and cover outbound curation policy, header refresh,
 redirect refusal, strict response shape, projection, paging, partial results,
-metadata refusal, cancellation, close and exact-id reads.
+`search_cutoff` refusal, offset-at-or-beyond-found EOF, row and page budgets,
+exact exponent/decimal integer fidelity across readers, recordsets, filters and
+native facet stats, metadata refusal, cancellation, close and exact-id reads.
 
 The integration suite starts one owned, pinned
 `typesense/typesense:30.2@sha256:610f2d34b1f93d00762869da2c67736775e5798d19a2c8b91b014b8a0cc1e110`
 container on a random loopback port, seeds native documents and a curation set
 that promotes a document excluded by a filter, and proves the unprotected
-server premise and the adapter's red-to-green filter enforcement.
+server premise and the adapter's red-to-green filter enforcement. It also
+exercises multi-page reads plus an offset at and beyond the real server's found
+count, and proves the configured page and row budgets against that server.

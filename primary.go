@@ -55,9 +55,11 @@ func (d *backend) Exists(ctx context.Context, key *record.Key) (bool, error) {
 
 // GetMulti reads a bounded batch with one exact-id search. All keys are
 // validated before the first request, so a malformed key or an oversized batch
-// performs no I/O. The whole batch shares one deadline, one byte budget and one
-// page. On failure the returned *GetMultiError names the first unread item;
-// earlier records stay populated and later records are left untouched.
+// performs no I/O. The batch is bounded by MaxGetMany and by MaxRowsPerPage,
+// the same per-request bound native search uses. The whole batch shares one
+// deadline, one byte budget and one page. On failure the returned
+// *GetMultiError names the first unread item; earlier records stay populated
+// and later records are left untouched.
 func (d *backend) GetMulti(ctx context.Context, records []record.Record) error {
 	if ctx == nil {
 		return errors.New("typesense: context is required")
@@ -107,6 +109,9 @@ func (d *backend) lookupIDs(ctx context.Context, ids []string) (map[string]Searc
 	if len(ids) > d.cfg.MaxGetMany {
 		return nil, notSupported("document lookup exceeds MaxGetMany")
 	}
+	if len(ids) > d.cfg.MaxRowsPerPage {
+		return nil, notSupported("document lookup exceeds MaxRowsPerPage")
+	}
 	collection, err := d.collection()
 	if err != nil {
 		return nil, err
@@ -132,9 +137,13 @@ func (d *backend) lookupIDs(ctx context.Context, ids []string) (map[string]Searc
 	if err != nil {
 		return nil, err
 	}
-	decoded, err := decodeSearchResponse(resp.body, len(ids), false)
+	decoded, err := decodeSearchResponse(resp.body, len(ids), false, d.cfg.MaxRowBytes)
 	if err != nil {
 		return nil, err
+	}
+	if decoded.cutoff {
+		// A cutoff must not be mistaken for a missing document or a full batch.
+		return nil, ErrPartialResult
 	}
 	if decoded.found != len(decoded.hits) {
 		return nil, malformed("exact-id search returned inconsistent counts")

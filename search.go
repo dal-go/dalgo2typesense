@@ -52,7 +52,8 @@ type SearchRequest struct {
 	MaxFacetValues int
 
 	// Limit is the positive number of hits to return. It is bounded by
-	// Config.MaxRows and the server's 250-hit page limit. Zero is refused.
+	// Config.MaxRows, Config.MaxRowsPerPage and the server's 250-hit page
+	// limit. Zero is refused.
 	Limit int
 
 	// Offset is the non-negative hit offset.
@@ -68,6 +69,8 @@ type SortField struct {
 // SearchResult is the bounded native result. Found and OutOf are server
 // metadata, distinct from the hits actually returned. Partial and Complete are
 // explicit: a server cap or cutoff is never presented as a clean end of data.
+// A Typesense search_cutoff response indicator sets Partial and clears
+// Complete even when the cutoff page returned zero hits and found is zero.
 type SearchResult struct {
 	Collection   string
 	Hits         []SearchHit
@@ -106,12 +109,15 @@ type FacetValue struct {
 	Highlighted string
 }
 
-// FacetStats retains the native stats object when Typesense returns one.
+// FacetStats retains the native stats object when Typesense returns one. The
+// numeric fields keep the exact JSON class: an integral statistic becomes int64
+// or uint64 and a fractional one becomes float64. Stats are never presented as
+// SQL aggregates.
 type FacetStats struct {
-	Min         float64
-	Max         float64
-	Sum         float64
-	Avg         float64
+	Min         any
+	Max         any
+	Sum         any
+	Avg         any
 	TotalValues int
 }
 
@@ -121,6 +127,7 @@ type searchWire struct {
 	OutOf        json.RawMessage `json:"out_of"`
 	Page         json.RawMessage `json:"page"`
 	SearchTimeMS json.RawMessage `json:"search_time_ms"`
+	SearchCutoff json.RawMessage `json:"search_cutoff"`
 	FacetCounts  json.RawMessage `json:"facet_counts"`
 }
 
@@ -131,6 +138,7 @@ type segment struct {
 	outOf    int
 	page     int
 	searchMS int
+	cutoff   bool
 }
 
 func (d *backend) Search(ctx context.Context, request SearchRequest) (SearchResult, error) {
@@ -147,7 +155,7 @@ func (d *backend) Search(ctx context.Context, request SearchRequest) (SearchResu
 	if err != nil {
 		return SearchResult{}, err
 	}
-	decoded, err := decodeSearchResponse(resp.body, request.Limit, len(request.FacetBy) > 0)
+	decoded, err := decodeSearchResponse(resp.body, request.Limit, len(request.FacetBy) > 0, d.cfg.MaxRowBytes)
 	if err != nil {
 		return SearchResult{}, err
 	}
@@ -247,8 +255,9 @@ func (d *backend) nativeQuery(request SearchRequest) (string, url.Values, error)
 		query.Set("max_facet_values", strconv.Itoa(maxFacetValues))
 	}
 
-	if request.Limit <= 0 || request.Limit > d.cfg.MaxRows || request.Limit > absoluteMaxRowsPerPage {
-		return "", nil, notSupported("typesense search requires a positive bounded limit")
+	if request.Limit <= 0 || request.Limit > d.cfg.MaxRows ||
+		request.Limit > d.cfg.MaxRowsPerPage || request.Limit > absoluteMaxRowsPerPage {
+		return "", nil, notSupported("typesense search requires a positive limit within MaxRows and MaxRowsPerPage")
 	}
 	if request.Offset < 0 || request.Offset > d.cfg.MaxOffset {
 		return "", nil, notSupported("typesense search offset is outside the configured bound")
@@ -264,8 +273,8 @@ func (d *backend) nativeQuery(request SearchRequest) (string, url.Values, error)
 func buildSearchResult(collection string, decoded segment, limit, offset int) SearchResult {
 	returned := len(decoded.hits)
 	truncated := decoded.found > offset+returned
-	partial := returned < limit && decoded.found > offset+returned
-	complete := !partial && !truncated
+	partial := decoded.cutoff || (returned < limit && decoded.found > offset+returned)
+	complete := !partial && !truncated && !decoded.cutoff
 	return SearchResult{
 		Collection:   collection,
 		Hits:         decoded.hits,
@@ -282,7 +291,7 @@ func buildSearchResult(collection string, decoded segment, limit, offset int) Se
 	}
 }
 
-func decodeSearchResponse(payload []byte, limit int, requireFacets bool) (segment, error) {
+func decodeSearchResponse(payload []byte, limit int, requireFacets bool, maxRowBytes int64) (segment, error) {
 	var wire searchWire
 	if err := decodeJSON(payload, &wire); err != nil {
 		return segment{}, err
@@ -309,6 +318,17 @@ func decodeSearchResponse(payload []byte, limit int, requireFacets bool) (segmen
 			return segment{}, err
 		}
 	}
+	cutoff := false
+	if trimmed := bytes.TrimSpace(wire.SearchCutoff); len(trimmed) > 0 {
+		// The indicator is a strict boolean. Absent means the server did not
+		// report a cutoff; null or any other class is malformed, never false.
+		if bytes.Equal(trimmed, []byte("null")) {
+			return segment{}, malformed("search_cutoff is not a boolean")
+		}
+		if err = decodeJSON(trimmed, &cutoff); err != nil {
+			return segment{}, malformed("search_cutoff is not a boolean")
+		}
+	}
 	rawHits, err := requiredArray(wire.Hits, "search hits")
 	if err != nil {
 		return segment{}, err
@@ -325,6 +345,13 @@ func decodeSearchResponse(payload []byte, limit int, requireFacets bool) (segmen
 		}
 		if seen[hit.ID] {
 			return segment{}, ErrDuplicateID
+		}
+		size, err := encodedSize(hit.Document)
+		if err != nil {
+			return segment{}, malformed("search hit document is not JSON-encodable")
+		}
+		if size > maxRowBytes {
+			return segment{}, ErrRowTooLarge
 		}
 		seen[hit.ID] = true
 		hits = append(hits, hit)
@@ -343,6 +370,7 @@ func decodeSearchResponse(payload []byte, limit int, requireFacets bool) (segmen
 		outOf:    outOf,
 		page:     page,
 		searchMS: searchMS,
+		cutoff:   cutoff,
 	}, nil
 }
 
@@ -485,18 +513,23 @@ func decodeFacetStats(raw json.RawMessage) (*FacetStats, error) {
 		return nil, err
 	}
 	stats := &FacetStats{}
-	for key, target := range map[string]*float64{
-		"min": &stats.Min,
-		"max": &stats.Max,
-		"sum": &stats.Sum,
-		"avg": &stats.Avg,
+	for _, field := range []struct {
+		name   string
+		target *any
+	}{
+		{"min", &stats.Min},
+		{"max", &stats.Max},
+		{"sum", &stats.Sum},
+		{"avg", &stats.Avg},
 	} {
-		if rawValue, ok := item[key]; ok {
-			value, _, err := optionalFloat(rawValue, "facet stats "+key)
+		if rawValue, ok := item[field.name]; ok {
+			value, present, err := optionalNumber(rawValue, "facet stats "+field.name)
 			if err != nil {
 				return nil, err
 			}
-			*target = value
+			if present {
+				*field.target = value
+			}
 		}
 	}
 	if rawTotal, ok := item["total_values"]; ok {

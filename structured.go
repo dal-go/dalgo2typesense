@@ -440,25 +440,24 @@ func formatUint(value uint64) (string, valueClass, error) {
 }
 
 func formatJSONNumber(value json.Number) (string, valueClass, error) {
-	text := value.String()
-	if strings.ContainsAny(text, ".eE") {
-		parsed, err := strconv.ParseFloat(text, 64)
-		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
-			return "", "", unsafeValue("invalid JSON number")
-		}
-		return strconv.FormatFloat(parsed, 'g', -1, 64), classNumber, nil
-	}
-	if strings.HasPrefix(text, "-") {
-		if _, err := strconv.ParseInt(text, 10, 64); err != nil {
-			return "", "", unsafeValue("JSON integer is outside int64")
-		}
-		return text, classNumber, nil
-	}
-	parsed, err := strconv.ParseUint(text, 10, 64)
+	exact, integral, err := exactDecimalInteger(value.String())
 	if err != nil {
-		return "", "", unsafeValue("JSON integer is outside uint64")
+		return "", "", unsafeValue("JSON number is outside the supported range")
 	}
-	return formatUint(parsed)
+	if integral {
+		switch number := exact.(type) {
+		case int64:
+			return strconv.FormatInt(number, 10), classNumber, nil
+		case uint64:
+			return formatUint(number)
+		}
+		return "", "", unsafeValue("JSON number is not supported")
+	}
+	parsed, err := strconv.ParseFloat(value.String(), 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return "", "", unsafeValue("invalid JSON number")
+	}
+	return strconv.FormatFloat(parsed, 'g', -1, 64), classNumber, nil
 }
 
 func validFilterString(value string) bool {

@@ -89,9 +89,12 @@ type Config struct {
 
 	// MaxRows is the largest accepted DALgo query or native search limit.
 	// Default 1000. Native search is one page, so it is additionally bounded by
-	// the server's 250-hit page limit.
+	// MaxRowsPerPage and the server's 250-hit page limit.
 	MaxRows int
 	// MaxRowsPerPage bounds one search request. Default 100, hard maximum 250.
+	// The structured reader uses it as its physical page size. Native search
+	// and exact-id GetMulti batches refuse a request larger than this bound
+	// instead of silently ignoring it.
 	MaxRowsPerPage int
 	// MaxPages bounds how many search requests one DALgo query may issue.
 	// Default 20.
@@ -108,7 +111,9 @@ type Config struct {
 	// MaxTotalBytes bounds the cumulative response bytes of one operation,
 	// including metadata, paging and batches. Default 16 MiB.
 	MaxTotalBytes int64
-	// MaxRowBytes bounds one decoded document's JSON size. Default 1 MiB.
+	// MaxRowBytes bounds one decoded native document's JSON size. Every read
+	// path enforces it before exposing the row: the structured reader, native
+	// search, Get, Exists and GetMulti. Default 1 MiB.
 	MaxRowBytes int64
 	// MaxFilterBytes bounds a native FilterBy expression and a compiled DALgo
 	// filter. Default 8 KiB.

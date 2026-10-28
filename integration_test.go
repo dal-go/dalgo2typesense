@@ -53,6 +53,9 @@ func TestTypesenseIntegration(t *testing.T) {
 
 	pureDB := f.db(t, "books", searchKey)
 	metadataDB := f.db(t, "books", metadataKey)
+	pagingDB := f.dbWithConfig(t, "books", searchKey, func(cfg *Config) {
+		cfg.MaxRowsPerPage = 3
+	})
 
 	t.Run("pure-search-key-works-without-metadata", func(t *testing.T) {
 		searcher, _ := dal.As[NativeSearcher](pureDB)
@@ -195,7 +198,7 @@ func TestTypesenseIntegration(t *testing.T) {
 
 		q := dal.From(dal.NewRootCollectionRef("books", "")).NewQuery().
 			OrderBy(dal.AscendingField("seq")).Limit(7).SelectIntoRecord(nil)
-		reader, err := pureDB.ExecuteQueryToRecordsReader(context.Background(), q)
+		reader, err := pagingDB.ExecuteQueryToRecordsReader(context.Background(), q)
 		if err != nil {
 			t.Fatalf("paged reader: %v", err)
 		}
@@ -213,6 +216,72 @@ func TestTypesenseIntegration(t *testing.T) {
 		_ = reader.Close()
 		if strings.Join(ids, ",") != "001,002,003,004,005,006,007" {
 			t.Fatalf("paged ids = %v", ids)
+		}
+	})
+
+	t.Run("native-offset-at-or-beyond-found", func(t *testing.T) {
+		searcher, _ := dal.As[NativeSearcher](pagingDB)
+		for _, tc := range []struct {
+			name   string
+			offset int
+		}{
+			{"at-found", 12},
+			{"beyond-found", 15},
+		} {
+			result, err := searcher.Search(context.Background(), SearchRequest{
+				Q: "*", Limit: 3, Offset: tc.offset, SortBy: []SortField{{Field: "seq"}},
+			})
+			if err != nil {
+				t.Fatalf("%s: Search: %v", tc.name, err)
+			}
+			if result.Returned != 0 || result.Found != 12 {
+				t.Fatalf("%s: returned/found = %d/%d, want 0/12",
+					tc.name, result.Returned, result.Found)
+			}
+			if result.Partial || !result.Complete {
+				t.Fatalf("%s: partial/complete = %v/%v, want false/true",
+					tc.name, result.Partial, result.Complete)
+			}
+		}
+
+		q := dal.From(dal.NewRootCollectionRef("books", "")).NewQuery().
+			OrderBy(dal.AscendingField("seq")).Limit(5).Offset(10).SelectIntoRecord(nil)
+		reader, err := pagingDB.ExecuteQueryToRecordsReader(context.Background(), q)
+		if err != nil {
+			t.Fatalf("offset reader: %v", err)
+		}
+		var ids []string
+		for {
+			rec, nextErr := reader.Next()
+			if errors.Is(nextErr, dal.ErrNoMoreRecords) {
+				break
+			}
+			if nextErr != nil {
+				t.Fatalf("offset Next: %v", nextErr)
+			}
+			ids = append(ids, rec.Key().ID.(string))
+		}
+		_ = reader.Close()
+		if strings.Join(ids, ",") != "011,012" {
+			t.Fatalf("offset ids = %v, want [011 012]", ids)
+		}
+	})
+
+	t.Run("configured-budgets-are-enforced", func(t *testing.T) {
+		pageDB := f.dbWithConfig(t, "books", searchKey, func(cfg *Config) {
+			cfg.MaxRowsPerPage = 2
+		})
+		pageSearcher, _ := dal.As[NativeSearcher](pageDB)
+		if _, err := pageSearcher.Search(context.Background(), SearchRequest{Q: "*", Limit: 3}); !errors.Is(err, dal.ErrNotSupported) {
+			t.Fatalf("oversized native search err = %v, want ErrNotSupported", err)
+		}
+
+		rowDB := f.dbWithConfig(t, "books", searchKey, func(cfg *Config) {
+			cfg.MaxRowBytes = 16
+		})
+		rec := record.NewRecordWithData(record.NewKeyWithID("books", "001"), &map[string]any{})
+		if err := rowDB.Get(context.Background(), rec); !errors.Is(err, ErrRowTooLarge) {
+			t.Fatalf("over-budget Get err = %v, want ErrRowTooLarge", err)
 		}
 	})
 
@@ -548,15 +617,23 @@ func (f *fixtureEnv) createKey(t *testing.T, description string, actions []strin
 
 func (f *fixtureEnv) db(t *testing.T, collection, key string) dal.DB {
 	t.Helper()
-	db, err := NewDB(context.Background(), Config{
+	return f.dbWithConfig(t, collection, key, nil)
+}
+
+func (f *fixtureEnv) dbWithConfig(t *testing.T, collection, key string, mutate func(*Config)) dal.DB {
+	t.Helper()
+	cfg := Config{
 		Endpoint:          f.endpoint,
 		Collection:        collection,
 		AllowLoopbackHTTP: true,
 		Headers: func(context.Context) (map[string]string, error) {
 			return map[string]string{"X-TYPESENSE-API-KEY": key}, nil
 		},
-		MaxRowsPerPage: 3,
-	})
+	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	db, err := NewDB(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
 	}

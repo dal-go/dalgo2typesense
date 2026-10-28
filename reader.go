@@ -109,13 +109,27 @@ func (r *recordsReader) Next() (record.Record, error) {
 	if err != nil {
 		return r.fail(err)
 	}
-	decoded, err := decodeSearchResponse(resp.body, pageSize, false)
+	decoded, err := decodeSearchResponse(resp.body, pageSize, false, r.db.cfg.MaxRowBytes)
 	if err != nil {
 		return r.fail(err)
 	}
 	r.pages++
-	if decoded.found < offset+len(decoded.hits) {
+	if decoded.cutoff {
+		// A cutoff is a partial refusal, never an end of data. It is reported
+		// even when the cutoff page itself returned zero hits and found is 0.
+		return r.fail(ErrPartialResult)
+	}
+	if len(decoded.hits) > 0 && decoded.found < offset+len(decoded.hits) {
 		return r.fail(malformed("search counts are inconsistent with the requested offset"))
+	}
+	if len(decoded.hits) == 0 {
+		// An offset at or beyond the server's found count is a valid empty
+		// result. Only a found count that still advertises hits after this
+		// offset is a partial result.
+		if decoded.found > offset {
+			return r.fail(ErrPartialResult)
+		}
+		return r.eof()
 	}
 	converted := make([]record.Record, 0, len(decoded.hits))
 	for _, hit := range decoded.hits {

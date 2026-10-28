@@ -118,27 +118,28 @@ func optionalBool(raw json.RawMessage, what string) (bool, bool, error) {
 	return value, true, nil
 }
 
-func optionalFloat(raw json.RawMessage, what string) (float64, bool, error) {
+func optionalNumber(raw json.RawMessage, what string) (any, bool, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
-		return 0, false, nil
+		return nil, false, nil
 	}
 	var number json.Number
 	if err := decodeJSON(trimmed, &number); err != nil {
-		return 0, false, malformed(what + " is not a number")
+		return nil, false, malformed(what + " is not a number")
 	}
-	value, err := strconv.ParseFloat(number.String(), 64)
-	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
-		return 0, false, malformed(what + " is not a finite number")
+	value, err := convertJSONNumber(number)
+	if err != nil {
+		return nil, false, err
 	}
 	return value, true, nil
 }
 
-// convertJSONNumbers converts a decoded UseNumber tree into lossless Go
-// scalars. Integers that fit int64 become int64; larger non-negative integers
-// that fit uint64 become uint64; all other JSON numbers remain float64 after
-// explicit finiteness validation. No number is routed through float64 before
-// integer representability is decided.
+// convertJSONNumbers converts a decoded UseNumber tree into Go scalars that
+// keep the exact value. Integral JSON numbers become int64 or uint64 even when
+// they are written with an exponent or a decimal point. Only non-integral
+// numbers become finite float64 values with documented IEEE754 semantics. No
+// number is routed through float64 before integer representability is decided,
+// and an integral value outside int64/uint64 is refused rather than rounded.
 func convertJSONNumbers(value any) (any, error) {
 	switch v := value.(type) {
 	case json.Number:
@@ -169,32 +170,145 @@ func convertJSONNumbers(value any) (any, error) {
 }
 
 func convertJSONNumber(number json.Number) (any, error) {
-	text := number.String()
-	if text == "" {
-		return nil, malformed("empty JSON number")
-	}
-	if strings.ContainsAny(text, ".eE") {
-		value, err := strconv.ParseFloat(text, 64)
-		if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
-			return nil, malformed("JSON number is not a finite float64")
-		}
-		return value, nil
-	}
-	if strings.HasPrefix(text, "-") {
-		value, err := strconv.ParseInt(text, 10, 64)
-		if err != nil {
-			return nil, malformed("JSON integer is outside int64")
-		}
-		return value, nil
-	}
-	value, err := strconv.ParseUint(text, 10, 64)
+	value, integral, err := exactDecimalInteger(number.String())
 	if err != nil {
-		return nil, malformed("JSON integer is outside uint64")
+		return nil, err
 	}
-	if value <= math.MaxInt64 {
-		return int64(value), nil
+	if integral {
+		return value, nil
 	}
-	return value, nil
+	parsed, err := strconv.ParseFloat(number.String(), 64)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return nil, malformed("JSON number is not a finite float64")
+	}
+	return parsed, nil
+}
+
+// exactDecimalInteger decides the exact integral value of a JSON number text.
+// It accepts every spelling JSON allows, including exponents and a decimal
+// point, and never converts through float64. For example 9007199254740993e0
+// and 9007199254740993.0 both stay exactly 9007199254740993, while the same
+// value written as a float would round to 9007199254740992.
+//
+// integral is false when the value is finite but not an integer; the caller may
+// then apply documented IEEE754 float64 semantics. err reports invalid syntax or
+// an integral value outside the int64/uint64 range.
+func exactDecimalInteger(text string) (value any, integral bool, err error) {
+	if text == "" {
+		return nil, false, malformed("empty JSON number")
+	}
+	negative := false
+	unsigned := text
+	switch unsigned[0] {
+	case '-':
+		negative = true
+		unsigned = unsigned[1:]
+	case '+':
+		return nil, false, malformed("JSON number has an invalid sign")
+	}
+	mantissa := unsigned
+	exponentText := ""
+	if index := strings.IndexAny(unsigned, "eE"); index >= 0 {
+		mantissa, exponentText = unsigned[:index], unsigned[index+1:]
+		if mantissa == "" || exponentText == "" || strings.ContainsAny(exponentText, "eE") {
+			return nil, false, malformed("JSON number is not valid")
+		}
+	}
+	exponentNegative := false
+	if exponentText != "" {
+		switch exponentText[0] {
+		case '-':
+			exponentNegative = true
+			exponentText = exponentText[1:]
+		case '+':
+			exponentText = exponentText[1:]
+		}
+		if !isDecimalDigits(exponentText) {
+			return nil, false, malformed("JSON number exponent is not valid")
+		}
+	}
+	fractionLength := 0
+	if dot := strings.IndexByte(mantissa, '.'); dot >= 0 {
+		if strings.IndexByte(mantissa[dot+1:], '.') >= 0 {
+			return nil, false, malformed("JSON number is not valid")
+		}
+		fractionLength = len(mantissa) - dot - 1
+		mantissa = mantissa[:dot] + mantissa[dot+1:]
+	}
+	if !isDecimalDigits(mantissa) {
+		return nil, false, malformed("JSON number is not valid")
+	}
+	digits := strings.TrimLeft(mantissa, "0")
+	if digits == "" {
+		// Any spelling of zero is exactly zero, whatever the exponent says.
+		return int64(0), true, nil
+	}
+	var exponent int64
+	if exponentText != "" {
+		if len(exponentText) > 6 {
+			// |exponent| > 999999. A non-zero value is either far outside
+			// int64/uint64 or a non-integral fraction underflowing float64, so
+			// this decision needs no big-integer expansion.
+			if exponentNegative {
+				return nil, false, nil
+			}
+			return nil, false, malformed("JSON integer is outside int64/uint64")
+		}
+		parsed, parseErr := strconv.ParseInt(exponentText, 10, 32)
+		if parseErr != nil {
+			return nil, false, malformed("JSON number exponent is not valid")
+		}
+		exponent = parsed
+		if exponentNegative {
+			exponent = -exponent
+		}
+	}
+	effective := exponent - int64(fractionLength)
+	if effective >= 0 {
+		if effective > 20 || int64(len(digits))+effective > 20 {
+			return nil, false, malformed("JSON integer is outside int64/uint64")
+		}
+		digits += strings.Repeat("0", int(effective))
+	} else {
+		scale := -effective
+		if scale > int64(len(digits)) {
+			return nil, false, nil
+		}
+		if strings.Trim(digits[len(digits)-int(scale):], "0") != "" {
+			return nil, false, nil
+		}
+		digits = digits[:len(digits)-int(scale)]
+		if digits == "" {
+			return int64(0), true, nil
+		}
+	}
+	if negative {
+		parsed, parseErr := strconv.ParseInt("-"+digits, 10, 64)
+		if parseErr != nil {
+			return nil, false, malformed("JSON integer is outside int64")
+		}
+		return parsed, true, nil
+	}
+	parsed, parseErr := strconv.ParseUint(digits, 10, 64)
+	if parseErr != nil {
+		return nil, false, malformed("JSON integer is outside uint64")
+	}
+	if parsed <= math.MaxInt64 {
+		return int64(parsed), true, nil
+	}
+	return parsed, true, nil
+}
+
+func isDecimalDigits(text string) bool {
+	if text == "" {
+		return false
+	}
+	for i := 0; i < len(text); i++ {
+		if text[i] < '0' || text[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func encodedSize(value any) (int64, error) {
