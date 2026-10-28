@@ -216,7 +216,7 @@ func facetBody(values int) string {
 		if i > 0 {
 			counts.WriteString(",")
 		}
-		counts.WriteString(fmt.Sprintf(`{"value":"v%d","count":1}`, i))
+		fmt.Fprintf(&counts, `{"value":"v%d","count":1}`, i)
 	}
 	return `{"found":0,"out_of":0,"page":1,"hits":[],"facet_counts":[
 		{"field_name":"genre","counts":[` + counts.String() + `]}]}`
