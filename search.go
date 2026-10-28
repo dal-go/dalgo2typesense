@@ -47,8 +47,9 @@ type SearchRequest struct {
 	// FacetBy lists facet-enabled fields.
 	FacetBy []string
 
-	// MaxFacetValues bounds the returned facet values. Zero uses the
-	// configured default; it can never exceed Config.MaxFacetValues.
+	// MaxFacetValues bounds the returned facet values. Zero uses the smaller
+	// of 10 and Config.MaxFacetValues; it can never exceed
+	// Config.MaxFacetValues.
 	MaxFacetValues int
 
 	// Limit is the positive number of hits to return. It is bounded by

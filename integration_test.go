@@ -94,11 +94,31 @@ func TestTypesenseIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DescribeCollection: %v", err)
 		}
-		if def.Name != "books" || len(def.Fields) < 10 {
+		if def.Name != "books" || len(def.Fields) != 12 {
 			t.Fatalf("schema = %+v", def)
 		}
-		if def.PrimaryKey[0] != "id" || def.SourceDefinition.Dialect != "typesense" {
+		if len(def.PrimaryKey) != 1 || def.PrimaryKey[0] != "id" ||
+			def.SourceDefinition == nil || def.SourceDefinition.Dialect != "typesense" {
 			t.Fatalf("identity/provenance = %+v", def)
+		}
+		idField := fieldDefByName(t, def.Fields, "id")
+		if idField.Type != dbschema.String || idField.Nullable {
+			t.Fatalf("implicit id field = %+v, want non-nullable string", idField)
+		}
+		idColumn := sourceColumnByName(t, def.SourceDefinition.Columns, "id")
+		if idColumn.DeclaredType != "string" || !idColumn.NotNull {
+			t.Fatalf("implicit id column = %+v, want declared string and NOT NULL", idColumn)
+		}
+		if countFieldDefs(def.Fields, "id") != 1 || countSourceColumns(def.SourceDefinition.Columns, "id") != 1 {
+			t.Fatalf("id identity is not exactly once: %+v / %+v", def.Fields, def.SourceDefinition.Columns)
+		}
+		tagsField := fieldDefByName(t, def.Fields, "tags")
+		if tagsField.Type != dbschema.Null || tagsField.Type == dbschema.String {
+			t.Fatalf("string[] tags portable type = %v, want dbschema.Null and never String", tagsField.Type)
+		}
+		tagsColumn := sourceColumnByName(t, def.SourceDefinition.Columns, "tags")
+		if tagsColumn.DeclaredType != "string[]" {
+			t.Fatalf("tags declared type = %q, want string[]", tagsColumn.DeclaredType)
 		}
 	})
 

@@ -40,7 +40,7 @@ result, err := searcher.Search(ctx, dalgo2typesense.SearchRequest{
     Q:          "dune",
     QueryBy:    []string{"title", "author"},
     FilterBy:   "year:>=1965 && genre:=`science fiction`",
-    SortBy:     []SortField{{Field: "rank", Descending: true}},
+    SortBy:     []dalgo2typesense.SortField{{Field: "rank", Descending: true}},
     FacetBy:    []string{"genre"},
     Limit:      20,
 })

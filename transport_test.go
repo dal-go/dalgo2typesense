@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -89,10 +90,10 @@ func TestMetadata_AuthorizedCredentialDiscoversSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DescribeCollection: %v", err)
 	}
-	if def.Name != "books" || len(def.Fields) != 5 {
+	if def.Name != "books" || len(def.Fields) != 6 {
 		t.Fatalf("def = %+v", def)
 	}
-	if def.PrimaryKey[0] != "id" {
+	if !reflect.DeepEqual(def.PrimaryKey, []dal.FieldName{"id"}) {
 		t.Fatalf("primary key = %v", def.PrimaryKey)
 	}
 	if def.Fields[0].Type != dbschema.String || def.Fields[2].Type != dbschema.Int {
@@ -106,6 +107,17 @@ func TestMetadata_AuthorizedCredentialDiscoversSchema(t *testing.T) {
 	}
 	if def.SourceDefinition == nil || def.SourceDefinition.Dialect != "typesense" {
 		t.Fatalf("source provenance missing: %+v", def.SourceDefinition)
+	}
+	idField := fieldDefByName(t, def.Fields, "id")
+	if idField.Type != dbschema.String || idField.Nullable {
+		t.Fatalf("implicit id field = %+v, want non-nullable string", idField)
+	}
+	idColumn := sourceColumnByName(t, def.SourceDefinition.Columns, "id")
+	if idColumn.DeclaredType != "string" || !idColumn.NotNull {
+		t.Fatalf("implicit id column = %+v, want declared string and NOT NULL", idColumn)
+	}
+	if len(def.SourceDefinition.Columns) != len(def.Fields) {
+		t.Fatalf("columns/fields = %d/%d", len(def.SourceDefinition.Columns), len(def.Fields))
 	}
 	indexes, err := reader.ListIndexes(context.Background(), ptrRef("books"))
 	if err != nil || len(indexes) != 0 {

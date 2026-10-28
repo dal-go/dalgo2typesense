@@ -34,6 +34,10 @@ type fieldWire struct {
 	Infix    json.RawMessage `json:"infix"`
 }
 
+// nativeIDField is the one built-in Typesense identity. It is always a string
+// and is absent from the declared field list of a normal collection.
+const nativeIDField = "id"
+
 // MetadataOrigin reports where collection metadata came from. It is
 // adapter-local so it does not extend DALgo core. "server" means the server's
 // collection catalog answered; "configured" means the adapter additionally
@@ -84,7 +88,8 @@ func (d *backend) ListCollections(ctx context.Context, parent *record.Key) ([]da
 
 // DescribeCollection reports the real Typesense schema for one collection.
 // Typesense has an implicit string id primary key; it is reported as the
-// primary key even when the id field is not declared in the schema.
+// primary key and as a non-nullable string field even when the id field is not
+// declared in the schema.
 func (d *backend) DescribeCollection(ctx context.Context, ref *dal.CollectionRef) (*dbschema.CollectionDef, error) {
 	if err := d.validateMetadataRef(ref); err != nil {
 		return nil, err
@@ -256,6 +261,12 @@ func decodeCollection(raw json.RawMessage) (collectionEntry, error) {
 		if !supportedSchemaType(field.Type) {
 			return collectionEntry{}, malformed("field type is not supported")
 		}
+		// Typesense's identity is always a string. An explicitly declared id
+		// with any other native type is impossible metadata; refuse it rather
+		// than inventing a second identity or misreporting the type.
+		if field.Name == nativeIDField && field.Type != "string" {
+			return collectionEntry{}, malformed("explicit id field type is not string")
+		}
 		if field.Facet, _, err = optionalBool(fieldWireValue.Facet, "field facet"); err != nil {
 			return collectionEntry{}, err
 		}
@@ -277,9 +288,13 @@ func decodeCollection(raw json.RawMessage) (collectionEntry, error) {
 }
 
 func (e collectionEntry) definition() *dbschema.CollectionDef {
-	fields := make([]dbschema.FieldDef, 0, len(e.Fields))
-	columns := make([]dbschema.SourceColumnDef, 0, len(e.Fields))
+	fields := make([]dbschema.FieldDef, 0, len(e.Fields)+1)
+	columns := make([]dbschema.SourceColumnDef, 0, len(e.Fields)+1)
+	declaredID := false
 	for _, field := range e.Fields {
+		if field.Name == nativeIDField {
+			declaredID = true
+		}
 		fields = append(fields, dbschema.FieldDef{
 			Name:     dal.FieldName(field.Name),
 			Type:     portableType(field.Type),
@@ -291,10 +306,27 @@ func (e collectionEntry) definition() *dbschema.CollectionDef {
 			NotNull:      !field.Optional,
 		})
 	}
+	if !declaredID {
+		// The built-in id is not part of the declared field list, but it is
+		// still part of the collection's typed identity. Report it in both
+		// forms: a non-nullable portable string and the truthful native
+		// declared type "string". It is never invented twice when the schema
+		// declares id explicitly (and a non-string explicit id is rejected
+		// while decoding).
+		fields = append(fields, dbschema.FieldDef{
+			Name: dal.FieldName(nativeIDField),
+			Type: dbschema.String,
+		})
+		columns = append(columns, dbschema.SourceColumnDef{
+			Name:         nativeIDField,
+			DeclaredType: "string",
+			NotNull:      true,
+		})
+	}
 	return &dbschema.CollectionDef{
 		Name:       e.Name,
 		Fields:     fields,
-		PrimaryKey: []dal.FieldName{"id"},
+		PrimaryKey: []dal.FieldName{nativeIDField},
 		SourceDefinition: &dbschema.SourceDefinition{
 			Dialect: "typesense",
 			Columns: columns,
@@ -304,18 +336,21 @@ func (e collectionEntry) definition() *dbschema.CollectionDef {
 
 func portableType(native string) dbschema.Type {
 	switch native {
-	case "string", "string[]":
+	case "string":
 		return dbschema.String
-	case "int32", "int64", "int32[]", "int64[]":
+	case "int32", "int64":
 		return dbschema.Int
-	case "float", "float[]":
+	case "float":
 		return dbschema.Float
-	case "bool", "bool[]":
+	case "bool":
 		return dbschema.Bool
 	default:
-		// object, object[], geopoint and geopolygon have no portable
-		// counterpart. Null means "no portable type" and the exact native type
-		// remains in SourceDefinition.DeclaredType.
+		// dbschema.Type is scalar-only, so arrays have no portable
+		// counterpart; mapping them to their element scalar would claim a
+		// shape the portable type cannot express. object, object[], geopoint,
+		// geopoint[] and geopolygon are also non-scalar. Null means "no
+		// portable type" and the exact native type, including any array
+		// suffix, remains in SourceDefinition.DeclaredType.
 		return dbschema.Null
 	}
 }
