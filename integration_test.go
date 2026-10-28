@@ -133,11 +133,11 @@ func TestTypesenseIntegration(t *testing.T) {
 		if containsID(ids, "001") {
 			t.Fatalf("adapter let curated 001 bypass filter_by: %v", ids)
 		}
-		for _, id := range ids {
-			if id != "004" && id != "006" {
-				t.Fatalf("unexpected cyberpunk id %q", id)
-			}
+		if result.Found != 2 || result.Returned != 2 || len(ids) != 2 {
+			t.Fatalf("adapter cyberpunk counts = found %d, returned %d, ids %v; want exactly 004 and 006",
+				result.Found, result.Returned, ids)
 		}
+		assertIDSet(t, ids, "004", "006")
 
 		q := dal.From(dal.NewRootCollectionRef("books", "")).NewQuery().
 			WhereField("genre", dal.Equal, "cyberpunk").Limit(10).SelectIntoRecord(nil)
@@ -149,11 +149,149 @@ func TestTypesenseIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read all: %v", err)
 		}
+		structuredIDs := make([]string, 0, len(records))
 		for _, rec := range records {
-			if rec.Key().ID == "001" {
-				t.Fatal("structured query let curated 001 bypass filter_by")
+			id, ok := rec.Key().ID.(string)
+			if !ok {
+				t.Fatalf("structured id %#v is not a string", rec.Key().ID)
+			}
+			structuredIDs = append(structuredIDs, id)
+		}
+		if containsID(structuredIDs, "001") {
+			t.Fatal("structured query let curated 001 bypass filter_by")
+		}
+		if len(structuredIDs) != 2 {
+			t.Fatalf("structured cyberpunk ids = %v; want exactly 004 and 006", structuredIDs)
+		}
+		assertIDSet(t, structuredIDs, "004", "006")
+	})
+
+	t.Run("native-text-query-by-title-and-author", func(t *testing.T) {
+		searcher, _ := dal.As[NativeSearcher](pureDB)
+
+		// A unique seeded title with a native filter, explicit sort and numeric
+		// facet. Native text search is not SQL: the assertion is only that the
+		// real Typesense hit and its native metadata came back.
+		result, err := searcher.Search(context.Background(), SearchRequest{
+			Collection: "books", Q: "Neuromancer", QueryBy: []string{"title"},
+			FilterBy: "genre:=cyberpunk", SortBy: []SortField{{Field: "seq", Descending: true}},
+			FacetBy: []string{"year"}, MaxFacetValues: 10, Limit: 5,
+		})
+		if err != nil {
+			t.Fatalf("title search: %v", err)
+		}
+		if result.Found != 1 || result.Returned != 1 || result.Partial || !result.Complete || result.Truncated {
+			t.Fatalf("title search counts = found %d, returned %d, partial %v, complete %v, truncated %v",
+				result.Found, result.Returned, result.Partial, result.Complete, result.Truncated)
+		}
+		if result.Page != 1 || result.Provenance != ProvenanceSearch {
+			t.Fatalf("title search page/provenance = %d/%q", result.Page, result.Provenance)
+		}
+		assertIDSet(t, hitIDs(result.Hits), "004")
+		hit := result.Hits[0]
+		if hit.Document["id"] != "004" || hit.Document["title"] != "Neuromancer" ||
+			hit.Document["author"] != "William Gibson" || hit.Document["genre"] != "cyberpunk" {
+			t.Fatalf("title search document identity = %#v", hit.Document)
+		}
+		if year, ok := hit.Document["year"].(int64); !ok || year != 1984 {
+			t.Fatalf("title search year = %#v (%T), want int64 1984", hit.Document["year"], hit.Document["year"])
+		}
+		if hit.TextMatch <= 0 {
+			t.Fatalf("title search text_match = %d, want a positive native rank", hit.TextMatch)
+		}
+		if hit.Curated {
+			t.Fatalf("title search returned a curated hit under enable_curations=false: %#v", hit)
+		}
+		if len(result.Facets) != 1 || result.Facets[0].Field != "year" {
+			t.Fatalf("title search facets = %+v", result.Facets)
+		}
+		yearFacet := result.Facets[0]
+		if len(yearFacet.Counts) != 1 || yearFacet.Counts[0].Value != "1984" || yearFacet.Counts[0].Count != 1 {
+			t.Fatalf("title search year facet = %+v", yearFacet.Counts)
+		}
+		if yearFacet.Stats == nil {
+			t.Fatal("title search year facet stats missing")
+		}
+		if yearFacet.Stats.Min != int64(1984) || yearFacet.Stats.Max != int64(1984) || yearFacet.Stats.Sum != int64(1984) {
+			t.Fatalf("title search year facet stats = min %#v, max %#v, sum %#v",
+				yearFacet.Stats.Min, yearFacet.Stats.Max, yearFacet.Stats.Sum)
+		}
+
+		// An exact seeded author query returns several real documents; the
+		// explicit sort proves the returned identity order, and the facets are
+		// native Typesense counts/stats rather than SQL aggregates.
+		result, err = searcher.Search(context.Background(), SearchRequest{
+			Collection: "books", Q: "Frank Herbert", QueryBy: []string{"author"},
+			FilterBy: "genre:=science fiction", SortBy: []SortField{{Field: "seq"}},
+			FacetBy: []string{"genre", "year"}, MaxFacetValues: 10, Limit: 5,
+		})
+		if err != nil {
+			t.Fatalf("author search: %v", err)
+		}
+		if result.Found != 3 || result.Returned != 3 || result.Partial || !result.Complete || result.Truncated {
+			t.Fatalf("author search counts = found %d, returned %d, partial %v, complete %v, truncated %v",
+				result.Found, result.Returned, result.Partial, result.Complete, result.Truncated)
+		}
+		if got := strings.Join(hitIDs(result.Hits), ","); got != "001,002,003" {
+			t.Fatalf("author search ids = %s, want 001,002,003", got)
+		}
+		for _, hit := range result.Hits {
+			if hit.Document["author"] != "Frank Herbert" || hit.TextMatch <= 0 {
+				t.Fatalf("author search hit = %#v", hit)
 			}
 		}
+		if len(result.Facets) != 2 {
+			t.Fatalf("author search facets = %+v", result.Facets)
+		}
+		genreFacet := facetForField(t, result.Facets, "genre")
+		if len(genreFacet.Counts) != 1 || genreFacet.Counts[0].Value != "science fiction" || genreFacet.Counts[0].Count != 3 {
+			t.Fatalf("author search genre facet = %+v", genreFacet.Counts)
+		}
+		authorYearFacet := facetForField(t, result.Facets, "year")
+		if len(authorYearFacet.Counts) != 3 {
+			t.Fatalf("author search year facet = %+v", authorYearFacet.Counts)
+		}
+		wantYears := map[string]int{"1965": 1, "1969": 1, "1976": 1}
+		for _, count := range authorYearFacet.Counts {
+			if wantYears[count.Value] != count.Count {
+				t.Fatalf("author search year facet = %+v, want %v", authorYearFacet.Counts, wantYears)
+			}
+		}
+		if authorYearFacet.Stats == nil {
+			t.Fatal("author search year facet stats missing")
+		}
+		if authorYearFacet.Stats.Min != int64(1965) || authorYearFacet.Stats.Max != int64(1976) ||
+			authorYearFacet.Stats.Sum != int64(5910) {
+			t.Fatalf("author search year facet stats = min %#v, max %#v, sum %#v",
+				authorYearFacet.Stats.Min, authorYearFacet.Stats.Max, authorYearFacet.Stats.Sum)
+		}
+
+		// Native Search deliberately does not send num_typos/prefix/
+		// drop_tokens_threshold, so these assertions pin the real 30.2 default
+		// semantics: a partial final token matches by prefix, and a token with
+		// no hits is dropped. Structured DALgo queries are the ones that disable
+		// these search behaviours.
+		prefix, err := searcher.Search(context.Background(), SearchRequest{
+			Collection: "books", Q: "Neuromanc", QueryBy: []string{"title"}, Limit: 5,
+		})
+		if err != nil {
+			t.Fatalf("prefix search: %v", err)
+		}
+		if prefix.Found != 1 || prefix.Returned != 1 {
+			t.Fatalf("prefix search counts = found %d, returned %d", prefix.Found, prefix.Returned)
+		}
+		assertIDSet(t, hitIDs(prefix.Hits), "004")
+
+		dropped, err := searcher.Search(context.Background(), SearchRequest{
+			Collection: "books", Q: "Dune Herbert", QueryBy: []string{"title"}, Limit: 5,
+		})
+		if err != nil {
+			t.Fatalf("drop-token search: %v", err)
+		}
+		if dropped.Found != 3 || dropped.Returned != 3 {
+			t.Fatalf("drop-token search counts = found %d, returned %d", dropped.Found, dropped.Returned)
+		}
+		assertIDSet(t, hitIDs(dropped.Hits), "001", "002", "003")
 	})
 
 	t.Run("native-fidelity-and-paging", func(t *testing.T) {
@@ -765,6 +903,17 @@ func hitIDs(hits []SearchHit) []string {
 		ids = append(ids, hit.ID)
 	}
 	return ids
+}
+
+func facetForField(t *testing.T, facets []Facet, field string) Facet {
+	t.Helper()
+	for _, facet := range facets {
+		if facet.Field == field {
+			return facet
+		}
+	}
+	t.Fatalf("facet %q missing from %+v", field, facets)
+	return Facet{}
 }
 
 func documentRanks(t *testing.T, hits []SearchHit) []int64 {
