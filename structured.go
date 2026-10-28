@@ -464,14 +464,6 @@ const (
 	classBool   valueClass = "bool"
 )
 
-func formatFilterValue(value any) (string, valueClass, error) {
-	literal, err := makeFilterLiteral(value)
-	if err != nil {
-		return "", "", err
-	}
-	return literal.wire, literal.class, nil
-}
-
 func formatUint(value uint64) (string, valueClass, error) {
 	if value > math.MaxInt64 {
 		return "", "", unsafeValue("unsigned integer exceeds Typesense int64 range")
