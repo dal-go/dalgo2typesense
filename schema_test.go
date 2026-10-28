@@ -169,6 +169,58 @@ func TestDecodeCollection_AcceptsDeclaredStringIDWithoutInventingAnother(t *test
 	}
 }
 
+// TestDecodeCollection_OptionalDeclaredStringIDStaysNonNullable is the rooted
+// regression for the built-in identity invariant: Typesense always returns an
+// id string and assigns one when it is omitted, so an explicit
+// id:string,optional:true declaration must not make the identity nullable.
+// The ordinary optional sibling keeps its declared optionality.
+func TestDecodeCollection_OptionalDeclaredStringIDStaysNonNullable(t *testing.T) {
+	raw := []byte(`{"name":"books","fields":[` +
+		`{"name":"id","type":"string","optional":true},` +
+		`{"name":"subtitle","type":"string","optional":true}]}`)
+	entry, err := decodeCollection(raw)
+	if err != nil {
+		t.Fatalf("decodeCollection: %v", err)
+	}
+	def := entry.definition()
+
+	if !reflect.DeepEqual(def.PrimaryKey, []dal.FieldName{"id"}) {
+		t.Fatalf("primary key = %v, want [id]", def.PrimaryKey)
+	}
+	if countFieldDefs(def.Fields, "id") != 1 {
+		t.Fatalf("portable id fields = %d, want exactly 1", countFieldDefs(def.Fields, "id"))
+	}
+	if countSourceColumns(def.SourceDefinition.Columns, "id") != 1 {
+		t.Fatalf("source id columns = %d, want exactly 1", countSourceColumns(def.SourceDefinition.Columns, "id"))
+	}
+	if len(def.Fields) != 2 || len(def.SourceDefinition.Columns) != 2 {
+		t.Fatalf("fields/columns = %d/%d, want 2/2 with no appended or dropped id",
+			len(def.Fields), len(def.SourceDefinition.Columns))
+	}
+	if def.Fields[0].Name != "id" || def.Fields[1].Name != "subtitle" ||
+		def.SourceDefinition.Columns[0].Name != "id" || def.SourceDefinition.Columns[1].Name != "subtitle" {
+		t.Fatalf("declared field order was not preserved: %+v / %+v", def.Fields, def.SourceDefinition.Columns)
+	}
+
+	idField := fieldDefByName(t, def.Fields, "id")
+	if idField.Type != dbschema.String || idField.Nullable {
+		t.Fatalf("declared optional id field = %+v, want non-nullable string", idField)
+	}
+	idColumn := sourceColumnByName(t, def.SourceDefinition.Columns, "id")
+	if idColumn.DeclaredType != "string" || !idColumn.NotNull {
+		t.Fatalf("declared optional id column = %+v, want declared string and NOT NULL", idColumn)
+	}
+
+	optionalField := fieldDefByName(t, def.Fields, "subtitle")
+	if !optionalField.Nullable {
+		t.Fatalf("ordinary optional field = %+v, want Nullable true", optionalField)
+	}
+	optionalColumn := sourceColumnByName(t, def.SourceDefinition.Columns, "subtitle")
+	if optionalColumn.NotNull {
+		t.Fatalf("ordinary optional column = %+v, want NotNull false", optionalColumn)
+	}
+}
+
 func fieldDefByName(t *testing.T, fields []dbschema.FieldDef, name string) dbschema.FieldDef {
 	t.Helper()
 	found := -1
