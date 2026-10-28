@@ -634,10 +634,10 @@ func TestNumeric_FilterKeepsIntegralExponent(t *testing.T) {
 		wantErr  bool
 	}{
 		{name: "exponent", operator: dal.Equal, number: "9007199254740993e0", want: "big:=9007199254740993"},
-		{name: "shifted", operator: dal.GreaterThen, number: "9.007199254740993e15", want: "big:>9007199254740993"},
+		{name: "shifted", operator: dal.GreaterThen, number: "9.007199254740993e15", want: "big:>=9007199254740993"},
 		{name: "decimal", operator: dal.Equal, number: "9007199254740993.0", want: "big:=9007199254740993"},
 		{name: "short-exponent", operator: dal.Equal, number: "1e2", want: "big:=100"},
-		{name: "fraction", operator: dal.GreaterThen, number: "1.5", want: "big:>1.5"},
+		{name: "fraction", operator: dal.GreaterThen, number: "1.5", want: "big:>=1.5"},
 		{name: "uint64-overflow", operator: dal.Equal, number: "18446744073709551616e0", wantErr: true},
 		{name: "beyond-typesense-int64", operator: dal.Equal, number: "18446744073709551615e0", wantErr: true},
 	} {

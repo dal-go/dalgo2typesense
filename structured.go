@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"math"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/dal-go/dalgo/dal"
 )
@@ -17,6 +17,10 @@ import (
 type searchPlan struct {
 	collection    string
 	filter        string
+	verifier      conditionVerifier
+	predicate     []string
+	filtered      bool
+	window        int
 	sort          []SortField
 	columns       []string
 	fetch         []string
@@ -62,28 +66,54 @@ func (d *backend) makePlan(query dal.Query) (searchPlan, error) {
 	if q.Offset() < 0 || q.Offset() > d.cfg.MaxOffset {
 		return searchPlan{}, notSupported("typesense query offset is outside the configured bound")
 	}
-	pageSize := d.cfg.MaxRowsPerPage
-	if pageSize > absoluteMaxRowsPerPage {
-		pageSize = absoluteMaxRowsPerPage
-	}
-	if q.Limit() < pageSize {
-		pageSize = q.Limit()
-	}
-	if requiredPages(q.Limit(), pageSize) > d.cfg.MaxPages {
-		return searchPlan{}, notSupported("typesense query needs more pages than MaxPages")
-	}
-
 	p := searchPlan{
 		collection: d.cfg.Collection,
 		limit:      q.Limit(),
 		offset:     q.Offset(),
-		pageSize:   pageSize,
 	}
 	var err error
 	budget := 0
-	if p.filter, err = compileCondition(q.Where(), 0, &budget, d.cfg.MaxFilterBytes); err != nil {
+	predicateFields := map[string]bool{}
+	if p.filter, p.verifier, err = compileConditionWithVerifier(
+		q.Where(), 0, &budget, d.cfg.MaxFilterBytes, predicateFields); err != nil {
 		return searchPlan{}, err
 	}
+	p.filtered = p.filter != ""
+	if p.filtered && p.verifier == nil {
+		return searchPlan{}, notSupported("typesense structured filter has no exact verifier")
+	}
+	for name := range predicateFields {
+		p.predicate = append(p.predicate, name)
+	}
+	sort.Strings(p.predicate)
+	if len(p.predicate) > d.cfg.MaxColumns {
+		return searchPlan{}, notSupported("typesense predicate helper fields exceed MaxColumns")
+	}
+
+	pageSize := d.cfg.MaxRowsPerPage
+	if pageSize > absoluteMaxRowsPerPage {
+		pageSize = absoluteMaxRowsPerPage
+	}
+	if p.filtered {
+		// A filtered request must validate every candidate before the requested
+		// offset, so its physical window is offset+limit and starts at zero.
+		p.window = q.Offset() + q.Limit()
+		if p.window < pageSize {
+			pageSize = p.window
+		}
+		if requiredPages(p.window, pageSize) > d.cfg.MaxPages {
+			return searchPlan{}, notSupported("typesense filtered candidate window needs more pages than MaxPages")
+		}
+	} else {
+		if q.Limit() < pageSize {
+			pageSize = q.Limit()
+		}
+		if requiredPages(q.Limit(), pageSize) > d.cfg.MaxPages {
+			return searchPlan{}, notSupported("typesense query needs more pages than MaxPages")
+		}
+	}
+	p.pageSize = pageSize
+
 	for _, order := range q.OrderBy() {
 		if order == nil {
 			return searchPlan{}, notSupported("typesense order expressions must name simple fields")
@@ -141,6 +171,25 @@ func (d *backend) makePlan(query dal.Query) (searchPlan, error) {
 		if !seen["id"] {
 			p.fetch = append([]string{"id"}, p.fetch...)
 		}
+		// Predicate helper fields are fetched with the declared projection so
+		// the exact verifier can see them. They count against the same
+		// MaxColumns bound and are stripped before output construction.
+		fetched := make(map[string]bool, len(p.fetch))
+		for _, name := range p.fetch {
+			fetched[name] = true
+		}
+		helpers := 0
+		for _, name := range p.predicate {
+			if fetched[name] {
+				continue
+			}
+			fetched[name] = true
+			p.fetch = append(p.fetch, name)
+			helpers++
+		}
+		if len(p.columns)+helpers > d.cfg.MaxColumns {
+			return searchPlan{}, notSupported("typesense predicate helper fields exceed MaxColumns")
+		}
 	}
 	return p, nil
 }
@@ -166,14 +215,25 @@ func structuredField(field dal.FieldRef) (string, error) {
 }
 
 func compileCondition(value dal.Condition, depth int, budget *int, maxBytes int) (string, error) {
+	text, _, err := compileConditionWithVerifier(value, depth, budget, maxBytes, nil)
+	return text, err
+}
+
+// compileConditionWithVerifier compiles the one admitted condition AST into a
+// native candidate filter and the exact verifier that decides whether a
+// candidate really satisfies the same tree. The two outputs are produced in
+// one traversal, so they cannot drift apart. Unsupported operators, value
+// classes and shapes fail here, before any request.
+func compileConditionWithVerifier(value dal.Condition, depth int, budget *int, maxBytes int, fields map[string]bool) (string, conditionVerifier, error) {
 	*budget++
 	if depth > defaultMaxDepth || *budget > defaultMaxConditions {
-		return "", notSupported("typesense condition tree exceeds the configured complexity bound")
+		return "", nil, notSupported("typesense condition tree exceeds the configured complexity bound")
 	}
 	if value == nil {
-		return "", nil
+		return "", nil, nil
 	}
 	var text string
+	var verifier conditionVerifier
 	switch c := value.(type) {
 	case dal.GroupCondition:
 		operator := ""
@@ -183,92 +243,116 @@ func compileCondition(value dal.Condition, depth int, budget *int, maxBytes int)
 		case dal.Or:
 			operator = " || "
 		default:
-			return "", notSupported("typesense supports AND/OR condition groups only")
+			return "", nil, notSupported("typesense supports AND/OR condition groups only")
 		}
 		if len(c.Conditions()) == 0 {
-			return "", notSupported("typesense empty condition groups are not supported")
+			return "", nil, notSupported("typesense empty condition groups are not supported")
 		}
 		parts := make([]string, 0, len(c.Conditions()))
+		children := make([]conditionVerifier, 0, len(c.Conditions()))
 		for _, child := range c.Conditions() {
 			if child == nil {
-				return "", notSupported("typesense nil conditions are not supported")
+				return "", nil, notSupported("typesense nil conditions are not supported")
 			}
-			childText, err := compileCondition(child, depth+1, budget, maxBytes)
+			childText, childVerifier, err := compileConditionWithVerifier(
+				child, depth+1, budget, maxBytes, fields)
 			if err != nil {
-				return "", err
+				return "", nil, err
 			}
-			if childText == "" {
-				return "", notSupported("typesense empty conditions are not supported")
+			if childText == "" || childVerifier == nil {
+				return "", nil, notSupported("typesense empty conditions are not supported")
 			}
 			parts = append(parts, childText)
+			children = append(children, childVerifier)
 		}
 		text = "(" + strings.Join(parts, operator) + ")"
+		verifier = groupVerifier{operator: c.Operator(), conditions: children}
 	case dal.Comparison:
 		field, ok := c.Left.(dal.FieldRef)
 		if !ok {
-			return "", notSupported("typesense comparisons must name a field on the left")
+			return "", nil, notSupported("typesense comparisons must name a field on the left")
 		}
 		name, err := structuredField(field)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
-		text, err = compileComparison(name, c.Operator, c.Right)
+		if fields != nil {
+			fields[name] = true
+		}
+		text, verifier, err = compileComparison(name, c.Operator, c.Right)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 	case dal.IsNullCondition:
 		// Typesense has no uniform three-valued NULL semantics for absent and
 		// explicit-null values, so both IS NULL and IS NOT NULL are refused
 		// before any request rather than silently matching only one class.
-		return "", notSupported("typesense NULL tests are not supported")
+		return "", nil, notSupported("typesense NULL tests are not supported")
 	default:
-		return "", notSupported("typesense condition type is not supported")
+		return "", nil, notSupported("typesense condition type is not supported")
 	}
 	if len(text) > maxBytes {
-		return "", ErrRequestTooLarge
+		return "", nil, ErrRequestTooLarge
 	}
-	return text, nil
+	return text, verifier, nil
 }
 
-func compileComparison(field string, operator dal.Operator, right dal.Expression) (string, error) {
+func compileComparison(field string, operator dal.Operator, right dal.Expression) (string, conditionVerifier, error) {
+	if operator == dal.NotIn {
+		// Native negative filters are not a safe superset for exact strings:
+		// normalization can omit a row that the admitted semantics would keep.
+		// The explicit native search path retains its negative filter grammar.
+		return "", nil, notSupported("typesense structured NOT IN is not supported")
+	}
 	switch r := right.(type) {
 	case dal.Constant:
-		if operator == dal.In || operator == dal.NotIn {
-			return "", notSupported("typesense IN filters require an array value")
+		if operator == dal.In {
+			return "", nil, notSupported("typesense IN filters require an array value")
 		}
 		if r.Value == nil {
-			return "", notSupported("typesense NULL comparisons are not supported")
+			return "", nil, notSupported("typesense NULL comparisons are not supported")
 		}
-		formatted, class, err := formatFilterValue(r.Value)
+		literal, err := makeFilterLiteral(r.Value)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
+		verifier := comparisonVerifier{field: field, operator: operator, literal: literal}
 		switch operator {
 		case dal.Equal:
-			if class == classString || class == classBool || class == classNumber {
-				return field + ":=" + formatted, nil
+			if literal.class == classString || literal.class == classBool || literal.class == classNumber {
+				return field + ":=" + literal.wire, verifier, nil
 			}
 		case dal.GreaterThen:
-			if class == classNumber {
-				return field + ":>" + formatted, nil
+			if literal.class == classNumber {
+				// A strict native > can omit strict-eligible raw values because
+				// a FLOAT index quantizes neighbouring decimals: for example
+				// n:>0.1 omitted the stored values 0.1000000001 and
+				// 0.10000000149 in the pinned 30.2 probe. The inclusive >=
+				// candidate is a documented superset. The verifier still
+				// evaluates the original > operator, so a boundary candidate is
+				// refused instead of being silently dropped.
+				return field + ":>=" + literal.wire, verifier, nil
 			}
 		case dal.GreaterOrEqual:
-			if class == classNumber {
-				return field + ":>=" + formatted, nil
+			if literal.class == classNumber {
+				return field + ":>=" + literal.wire, verifier, nil
 			}
 		case dal.LessThen:
-			if class == classNumber {
-				return field + ":<" + formatted, nil
+			if literal.class == classNumber {
+				// Symmetric to >: a strict native < can omit strict-eligible
+				// values on the quantized boundary, so the candidate is <=.
+				// The verifier keeps the original < operator.
+				return field + ":<=" + literal.wire, verifier, nil
 			}
 		case dal.LessOrEqual:
-			if class == classNumber {
-				return field + ":<=" + formatted, nil
+			if literal.class == classNumber {
+				return field + ":<=" + literal.wire, verifier, nil
 			}
 		}
-		return "", notSupported("typesense comparison operator is not supported for this value class")
+		return "", nil, notSupported("typesense comparison operator is not supported for this value class")
 	case dal.Array:
-		if operator != dal.In && operator != dal.NotIn {
-			return "", notSupported("typesense array values require IN or NOT IN")
+		if operator != dal.In {
+			return "", nil, notSupported("typesense array values require IN")
 		}
 		values, ok := r.Value.([]any)
 		if !ok {
@@ -277,32 +361,31 @@ func compileComparison(field string, operator dal.Operator, right dal.Expression
 			var err error
 			values, err = arrayValues(r.Value)
 			if err != nil {
-				return "", err
+				return "", nil, err
 			}
 		}
 		if len(values) == 0 {
-			return "", notSupported("typesense empty IN lists are not supported")
+			return "", nil, notSupported("typesense empty IN lists are not supported")
 		}
 		formatted := make([]string, 0, len(values))
+		literals := make([]filterLiteral, 0, len(values))
 		var class valueClass
 		for _, value := range values {
-			rendered, current, err := formatFilterValue(value)
+			literal, err := makeFilterLiteral(value)
 			if err != nil {
-				return "", err
+				return "", nil, err
 			}
-			if class != "" && class != current {
-				return "", notSupported("typesense IN lists must use one scalar class")
+			if class != "" && class != literal.class {
+				return "", nil, notSupported("typesense IN lists must use one scalar class")
 			}
-			class = current
-			formatted = append(formatted, rendered)
+			class = literal.class
+			formatted = append(formatted, literal.wire)
+			literals = append(literals, literal)
 		}
-		operatorText := ":="
-		if operator == dal.NotIn {
-			operatorText = ":!="
-		}
-		return field + operatorText + "[" + strings.Join(formatted, ",") + "]", nil
+		return field + ":=" + "[" + strings.Join(formatted, ",") + "]",
+			comparisonVerifier{field: field, operator: dal.In, literals: literals}, nil
 	default:
-		return "", notSupported("typesense comparison values must be literals")
+		return "", nil, notSupported("typesense comparison values must be literals")
 	}
 }
 
@@ -382,54 +465,11 @@ const (
 )
 
 func formatFilterValue(value any) (string, valueClass, error) {
-	switch v := value.(type) {
-	case string:
-		if v == "" || len(v) > 1024 || !validFilterString(v) {
-			return "", "", unsafeValue("filter string constant is not supported")
-		}
-		return "`" + v + "`", classString, nil
-	case bool:
-		if v {
-			return "true", classBool, nil
-		}
-		return "false", classBool, nil
-	case int:
-		return strconv.FormatInt(int64(v), 10), classNumber, nil
-	case int8:
-		return strconv.FormatInt(int64(v), 10), classNumber, nil
-	case int16:
-		return strconv.FormatInt(int64(v), 10), classNumber, nil
-	case int32:
-		return strconv.FormatInt(int64(v), 10), classNumber, nil
-	case int64:
-		return strconv.FormatInt(v, 10), classNumber, nil
-	case uint:
-		return formatUint(uint64(v))
-	case uint8:
-		return formatUint(uint64(v))
-	case uint16:
-		return formatUint(uint64(v))
-	case uint32:
-		return formatUint(uint64(v))
-	case uint64:
-		return formatUint(v)
-	case float32:
-		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
-			return "", "", unsafeValue("non-finite numbers are not supported")
-		}
-		return strconv.FormatFloat(float64(v), 'g', -1, 32), classNumber, nil
-	case float64:
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return "", "", unsafeValue("non-finite numbers are not supported")
-		}
-		return strconv.FormatFloat(v, 'g', -1, 64), classNumber, nil
-	case json.Number:
-		return formatJSONNumber(v)
-	case time.Time:
-		return "", "", notSupported("typesense filter timestamps must be numeric application values")
-	default:
-		return "", "", notSupported("typesense comparison values must be JSON scalars")
+	literal, err := makeFilterLiteral(value)
+	if err != nil {
+		return "", "", err
 	}
+	return literal.wire, literal.class, nil
 }
 
 func formatUint(value uint64) (string, valueClass, error) {

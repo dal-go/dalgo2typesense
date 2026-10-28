@@ -79,6 +79,15 @@ var (
 	// ErrCollectionNotConfigured reports a structured query or configured
 	// metadata request on an adapter without a configured collection.
 	ErrCollectionNotConfigured = errors.New("typesense: no collection is configured")
+
+	// ErrSemanticMismatch reports that a native Typesense candidate does not
+	// satisfy the exact admitted DALgo predicate. Native string folding and
+	// array matching make filter_by a candidate producer, never the final
+	// semantic authority; such a candidate is refused instead of silently
+	// dropped, exposed or retried around. It also unwraps to
+	// dal.ErrNotSupported because the adapter honestly cannot produce the
+	// requested exact result under the existing bounds.
+	ErrSemanticMismatch = errors.New("typesense: candidate does not satisfy the exact query semantics")
 )
 
 // HTTPError is a safe Typesense HTTP status error. Only the numeric status is
@@ -133,6 +142,14 @@ var (
 
 func notSupported(reason string) error {
 	return fmt.Errorf("%w: %s", dal.ErrNotSupported, reason)
+}
+
+// semanticMismatch is a typed unsupported refusal: the request itself is
+// admitted, but a real candidate proves that the native filter's broader
+// string/array semantics cannot satisfy it exactly within the configured
+// bounds. It never names a document or a field value.
+func semanticMismatch(reason string) error {
+	return fmt.Errorf("%w: %w: %s", dal.ErrNotSupported, ErrSemanticMismatch, reason)
 }
 
 func unsafeValue(reason string) error {

@@ -210,7 +210,7 @@ func TestStructuredQuery_FlagsProjectionAndPaging(t *testing.T) {
 		if query.Get("filter_by") != "(author:=`Frank Herbert` && year:>=1965)" {
 			t.Errorf("filter_by = %q", query.Get("filter_by"))
 		}
-		if query.Get("include_fields") != "id,title,rank" {
+		if query.Get("include_fields") != "id,title,rank,author,year" {
 			t.Errorf("include_fields = %q", query.Get("include_fields"))
 		}
 		switch n {
@@ -219,14 +219,14 @@ func TestStructuredQuery_FlagsProjectionAndPaging(t *testing.T) {
 				t.Errorf("page 1 paging: offset=%q limit=%q", query.Get("offset"), query.Get("limit"))
 			}
 			writeJSON(t, w, http.StatusOK, `{"found":3,"out_of":10,"page":1,"hits":[
-				{"document":{"id":"001","title":"Dune","rank":1}},
-				{"document":{"id":"002","title":"Dune Messiah","rank":2}}]}`)
+				{"document":{"id":"001","title":"Dune","rank":1,"author":"Frank Herbert","year":1965}},
+				{"document":{"id":"002","title":"Dune Messiah","rank":2,"author":"Frank Herbert","year":1969}}]}`)
 		case 2:
 			if query.Get("offset") != "2" || query.Get("limit") != "1" {
 				t.Errorf("page 2 paging: offset=%q limit=%q", query.Get("offset"), query.Get("limit"))
 			}
 			writeJSON(t, w, http.StatusOK, `{"found":3,"out_of":10,"page":1,"hits":[
-				{"document":{"id":"003","title":"Children of Dune","rank":3}}]}`)
+				{"document":{"id":"003","title":"Children of Dune","rank":3,"author":"Frank Herbert","year":1976}}]}`)
 		default:
 			t.Errorf("unexpected request %d", n)
 		}

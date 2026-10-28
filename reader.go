@@ -48,6 +48,7 @@ type recordsReader struct {
 	total    int
 	pages    int
 	seen     map[string]bool
+	buffered bool
 	terminal error
 	closed   bool
 }
@@ -63,6 +64,22 @@ func (r *recordsReader) Next() (record.Record, error) {
 	}
 	if err := r.op.check(); err != nil {
 		return r.fail(safeContextError(r.op.ctx, err))
+	}
+	if r.plan.filtered {
+		// A filtered query buffers and verifies the complete candidate window
+		// before the first row can be exposed. This is deliberate: a later
+		// page mismatch must not leave an apparently successful earlier prefix.
+		if !r.buffered {
+			if err := r.bufferFiltered(); err != nil {
+				return r.fail(err)
+			}
+		}
+		if r.pos < len(r.page) {
+			rec := r.page[r.pos]
+			r.pos++
+			return rec, nil
+		}
+		return r.eof()
 	}
 	if r.pos < len(r.page) {
 		rec := r.page[r.pos]
@@ -80,30 +97,7 @@ func (r *recordsReader) Next() (record.Record, error) {
 		pageSize = remaining
 	}
 	offset := r.plan.offset + r.total
-	query := url.Values{}
-	query.Set("q", "*")
-	if r.plan.filter != "" {
-		query.Set("filter_by", r.plan.filter)
-	}
-	if len(r.plan.sort) > 0 {
-		sorts := make([]string, 0, len(r.plan.sort))
-		for _, field := range r.plan.sort {
-			direction := "asc"
-			if field.Descending {
-				direction = "desc"
-			}
-			sorts = append(sorts, field.Field+":"+direction)
-		}
-		query.Set("sort_by", strings.Join(sorts, ","))
-	}
-	if r.plan.hasProjection {
-		query.Set("include_fields", strings.Join(r.plan.fetch, ","))
-	}
-	if offset > 0 {
-		query.Set("offset", strconv.Itoa(offset))
-	}
-	query.Set("limit", strconv.Itoa(pageSize))
-	setStructuredPolicy(query)
+	query := r.searchQuery(offset, pageSize)
 
 	resp, err := r.db.request(r.op, searchPath(r.plan.collection), query)
 	if err != nil {
@@ -162,6 +156,129 @@ func (r *recordsReader) Next() (record.Record, error) {
 	rec := r.page[0]
 	r.pos = 1
 	return rec, nil
+}
+
+// searchQuery builds the bounded structured search request for one physical
+// page. It is shared by the lazy unfiltered path and the buffered filtered path
+// so both always send the same policy flags, projection and sort.
+func (r *recordsReader) searchQuery(offset, pageSize int) url.Values {
+	query := url.Values{}
+	query.Set("q", "*")
+	if r.plan.filter != "" {
+		query.Set("filter_by", r.plan.filter)
+	}
+	if len(r.plan.sort) > 0 {
+		sorts := make([]string, 0, len(r.plan.sort))
+		for _, field := range r.plan.sort {
+			direction := "asc"
+			if field.Descending {
+				direction = "desc"
+			}
+			sorts = append(sorts, field.Field+":"+direction)
+		}
+		query.Set("sort_by", strings.Join(sorts, ","))
+	}
+	if r.plan.hasProjection {
+		query.Set("include_fields", strings.Join(r.plan.fetch, ","))
+	}
+	if offset > 0 {
+		query.Set("offset", strconv.Itoa(offset))
+	}
+	query.Set("limit", strconv.Itoa(pageSize))
+	setStructuredPolicy(query)
+	return query
+}
+
+// bufferFiltered fetches and verifies the complete bounded filtered candidate
+// window before the first row can be exposed. It always starts at native offset
+// zero, reads through the requested offset+limit candidates, checks every
+// candidate against the exact whole predicate and only then applies the
+// requested offset locally. Any mismatching candidate is a typed semantic
+// refusal: the row is neither silently dropped nor exposed, and no earlier
+// apparently successful prefix survives. The whole buffer shares the
+// operation's deadline, page and cumulative byte budgets.
+func (r *recordsReader) bufferFiltered() error {
+	window := r.plan.window
+	verified := make([]record.Record, 0, min(window, r.plan.pageSize*r.db.cfg.MaxPages))
+	offset := 0
+	for offset < window {
+		if err := r.op.check(); err != nil {
+			return safeContextError(r.op.ctx, err)
+		}
+		if r.pages >= r.db.cfg.MaxPages {
+			return ErrTooManyPages
+		}
+		pageSize := r.plan.pageSize
+		if remaining := window - offset; remaining < pageSize {
+			pageSize = remaining
+		}
+		resp, err := r.db.request(r.op, searchPath(r.plan.collection), r.searchQuery(offset, pageSize))
+		if err != nil {
+			return err
+		}
+		decoded, err := decodeSearchResponse(resp.body, pageSize, offset, nil, 0, r.db.cfg.MaxRowBytes)
+		if err != nil {
+			return err
+		}
+		r.pages++
+		if decoded.cutoff {
+			return ErrPartialResult
+		}
+		if len(decoded.hits) == 0 {
+			if decoded.found > offset {
+				return ErrPartialResult
+			}
+			break
+		}
+		for _, hit := range decoded.hits {
+			if err := r.op.check(); err != nil {
+				return safeContextError(r.op.ctx, err)
+			}
+			if r.seen[hit.ID] {
+				return ErrDuplicateID
+			}
+			ok, err := r.plan.verifier.match(hit.Document)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return semanticMismatch("native filter candidate does not satisfy the exact query predicate")
+			}
+			data, err := projectedDocument(hit, r.plan)
+			if err != nil {
+				return err
+			}
+			size, err := encodedSize(data)
+			if err != nil {
+				return malformed("document is not JSON-encodable")
+			}
+			if size > r.db.cfg.MaxRowBytes {
+				return ErrRowTooLarge
+			}
+			r.seen[hit.ID] = true
+			verified = append(verified, record.NewRecordWithData(
+				record.NewKeyWithID(r.plan.collection, hit.ID), data))
+		}
+		offset += len(decoded.hits)
+		if len(decoded.hits) < pageSize {
+			if decoded.found > offset {
+				return ErrPartialResult
+			}
+			break
+		}
+	}
+	start := r.plan.offset
+	if start > len(verified) {
+		start = len(verified)
+	}
+	end := start + r.plan.limit
+	if end > len(verified) {
+		end = len(verified)
+	}
+	r.page = verified[start:end]
+	r.pos = 0
+	r.buffered = true
+	return nil
 }
 
 func (r *recordsReader) Cursor() (string, error) {
