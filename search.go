@@ -125,13 +125,12 @@ type searchWire struct {
 }
 
 type segment struct {
-	collection string
-	hits       []SearchHit
-	facets     []Facet
-	found      int
-	outOf      int
-	page       int
-	searchMS   int
+	hits     []SearchHit
+	facets   []Facet
+	found    int
+	outOf    int
+	page     int
+	searchMS int
 }
 
 func (d *backend) Search(ctx context.Context, request SearchRequest) (SearchResult, error) {

@@ -19,8 +19,6 @@ type operation struct {
 
 	bytes    int64
 	requests int
-	rows     int
-	pages    int
 }
 
 func (d *backend) newOperation(ctx context.Context) (*operation, error) {
@@ -181,12 +179,4 @@ func setStructuredPolicy(query url.Values) {
 	query.Set("prefix", "false")
 	query.Set("drop_tokens_threshold", "0")
 	query.Set("typo_tokens_threshold", "0")
-}
-
-func (o *operation) countPage(maxPages int) error {
-	o.pages++
-	if o.pages > maxPages {
-		return ErrTooManyPages
-	}
-	return nil
 }
