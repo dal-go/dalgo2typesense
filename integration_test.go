@@ -111,6 +111,9 @@ func TestTypesenseIntegration(t *testing.T) {
 		if !containsID(unprotected, "001") {
 			t.Fatalf("fixture premise failed: default Typesense curations did not promote filtered document 001: %v", unprotected)
 		}
+		// The raw default query must show the vulnerable premise non-vacuously:
+		// the curated 001 plus both real cyberpunk documents.
+		assertIDSet(t, unprotected, "001", "004", "006")
 		protected := f.searchIDs(t, searchKey, url.Values{
 			"q":                   {"*"},
 			"filter_by":           {"genre:=cyberpunk"},
@@ -121,6 +124,9 @@ func TestTypesenseIntegration(t *testing.T) {
 		if containsID(protected, "001") {
 			t.Fatalf("filter_curated_hits=true did not remove curated 001: %v", protected)
 		}
+		// The protected direct query is also non-vacuous: it still returns both
+		// permitted cyberpunk documents.
+		assertIDSet(t, protected, "004", "006")
 
 		searcher, _ := dal.As[NativeSearcher](pureDB)
 		result, err := searcher.Search(context.Background(), SearchRequest{
@@ -268,9 +274,9 @@ func TestTypesenseIntegration(t *testing.T) {
 
 		// Native Search deliberately does not send num_typos/prefix/
 		// drop_tokens_threshold, so these assertions pin the real 30.2 default
-		// semantics: a partial final token matches by prefix, and a token with
-		// no hits is dropped. Structured DALgo queries are the ones that disable
-		// these search behaviours.
+		// semantics: one typo is tolerated, a partial final token matches by
+		// prefix, and a token with no hits is dropped. Structured DALgo queries
+		// are the ones that disable these search behaviours.
 		prefix, err := searcher.Search(context.Background(), SearchRequest{
 			Collection: "books", Q: "Neuromanc", QueryBy: []string{"title"}, Limit: 5,
 		})
@@ -281,6 +287,18 @@ func TestTypesenseIntegration(t *testing.T) {
 			t.Fatalf("prefix search counts = found %d, returned %d", prefix.Found, prefix.Returned)
 		}
 		assertIDSet(t, hitIDs(prefix.Hits), "004")
+
+		// One missing character is within the native default typo tolerance.
+		typo, err := searcher.Search(context.Background(), SearchRequest{
+			Collection: "books", Q: "Neuromancr", QueryBy: []string{"title"}, Limit: 5,
+		})
+		if err != nil {
+			t.Fatalf("typo search: %v", err)
+		}
+		if typo.Found != 1 || typo.Returned != 1 {
+			t.Fatalf("typo search counts = found %d, returned %d", typo.Found, typo.Returned)
+		}
+		assertIDSet(t, hitIDs(typo.Hits), "004")
 
 		dropped, err := searcher.Search(context.Background(), SearchRequest{
 			Collection: "books", Q: "Dune Herbert", QueryBy: []string{"title"}, Limit: 5,
