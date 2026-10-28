@@ -292,3 +292,24 @@ func TestBadKeyAndForbiddenCollectionAreClassified(t *testing.T) {
 		t.Fatal("provider error text leaked")
 	}
 }
+
+func TestReadonlyTransactionRefusedBeforeIO(t *testing.T) {
+	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("refused transaction performed I/O")
+	})
+	db := newTestDB(t, server, nil)
+	called := false
+	err := db.RunReadonlyTransaction(context.Background(), func(context.Context, dal.ReadTransaction) error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, dal.ErrNotSupported) {
+		t.Fatalf("err = %v, want ErrNotSupported", err)
+	}
+	if called {
+		t.Fatal("readonly transaction callback ran")
+	}
+	if server.requests.Load() != 0 {
+		t.Fatalf("refused transaction performed %d I/O calls", server.requests.Load())
+	}
+}

@@ -163,21 +163,14 @@ func (d *backend) Close() error {
 	return nil
 }
 
-// RunReadonlyTransaction runs a bounded read callback. Typesense has no
-// stateful transaction or snapshot semantics, so the adapter does not pretend
-// that a DALgo readonly transaction is one; the callback runs against the same
-// stateless read surface.
-func (d *backend) RunReadonlyTransaction(ctx context.Context, f dal.ROTxWorker, options ...dal.TransactionOption) error {
+// RunReadonlyTransaction refuses before any I/O. Typesense search has no
+// stateful transaction, snapshot or read-your-writes semantics, so the adapter
+// does not pretend that a DALgo readonly transaction is one.
+func (*backend) RunReadonlyTransaction(ctx context.Context, _ dal.ROTxWorker, _ ...dal.TransactionOption) error {
 	if ctx == nil {
 		return errors.New("typesense: context is required")
 	}
-	if d.closed.Load() {
-		return ErrClosed
-	}
-	if f == nil {
-		return notSupported("typesense readonly transactions require a callback")
-	}
-	return f(ctx, readTx{backend: d, options: dal.NewTransactionOptions(options...)})
+	return notSupported("typesense has no stateful readonly transactions")
 }
 
 // RunReadwriteTransaction refuses before any I/O. Typesense search is
@@ -185,13 +178,6 @@ func (d *backend) RunReadonlyTransaction(ctx context.Context, f dal.ROTxWorker, 
 func (*backend) RunReadwriteTransaction(context.Context, dal.RWTxWorker, ...dal.TransactionOption) error {
 	return notSupported("typesense adapter is read-only and has no read-write transactions")
 }
-
-type readTx struct {
-	*backend
-	options dal.TransactionOptions
-}
-
-func (t readTx) Options() dal.TransactionOptions { return t.options }
 
 func (d *backend) collection() (string, error) {
 	if d.cfg.Collection == "" {
