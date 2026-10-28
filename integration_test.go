@@ -219,6 +219,97 @@ func TestTypesenseIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("native-default-sort-ties-and-maxsort", func(t *testing.T) {
+		searcher, _ := dal.As[NativeSearcher](pureDB)
+		defaultResult, err := searcher.Search(context.Background(), SearchRequest{Q: "*", Limit: 12})
+		if err != nil {
+			t.Fatalf("default-sort search: %v", err)
+		}
+		if defaultResult.Returned != 12 || !defaultResult.Complete {
+			t.Fatalf("default-sort returned/complete = %d/%v", defaultResult.Returned, defaultResult.Complete)
+		}
+		ranks := documentRanks(t, defaultResult.Hits)
+		wantRanks := []int64{100, 90, 80, 70, 60, 50, 40, 30, 20, 20, 10, 10}
+		if !equalInt64s(ranks, wantRanks) {
+			t.Fatalf("default-sort ranks = %v, want %v", ranks, wantRanks)
+		}
+		if defaultResult.Hits[0].ID != "012" {
+			t.Fatalf("default-sort first id = %q, want 012", defaultResult.Hits[0].ID)
+		}
+		tiedRanks := map[int64][]string{}
+		for _, hit := range defaultResult.Hits {
+			rank := hit.Document["rank"].(int64)
+			tiedRanks[rank] = append(tiedRanks[rank], hit.ID)
+		}
+		assertIDSet(t, tiedRanks[20], "003", "004")
+		assertIDSet(t, tiedRanks[10], "001", "002")
+
+		// rank has duplicate values. An explicit second sort field makes the
+		// page boundary repeatable without inventing an id sort.
+		twoSorts := []SortField{{Field: "rank", Descending: true}, {Field: "seq"}}
+		tied, err := searcher.Search(context.Background(), SearchRequest{
+			Q: "*", SortBy: twoSorts, Limit: 12,
+		})
+		if err != nil {
+			t.Fatalf("two-field sort: %v", err)
+		}
+		wantIDs := []string{"012", "011", "010", "009", "008", "007", "006", "005", "003", "004", "001", "002"}
+		if got := strings.Join(hitIDs(tied.Hits), ","); got != strings.Join(wantIDs, ",") {
+			t.Fatalf("two-field sort ids = %s, want %s", got, strings.Join(wantIDs, ","))
+		}
+
+		// The server accepts three sort fields; the adapter accepts exactly the
+		// same maximum and refuses a fourth before any request.
+		threeSorts := append(append([]SortField(nil), twoSorts...), SortField{Field: "year"})
+		three, err := searcher.Search(context.Background(), SearchRequest{
+			Q: "*", SortBy: threeSorts, Limit: 12,
+		})
+		if err != nil {
+			t.Fatalf("three-field sort: %v", err)
+		}
+		if got := strings.Join(hitIDs(three.Hits), ","); got != strings.Join(wantIDs, ",") {
+			t.Fatalf("three-field sort ids = %s, want %s", got, strings.Join(wantIDs, ","))
+		}
+		fourSorts := append(append([]SortField(nil), threeSorts...), SortField{Field: "active"})
+		if _, err = searcher.Search(context.Background(), SearchRequest{Q: "*", SortBy: fourSorts, Limit: 1}); !errors.Is(err, dal.ErrNotSupported) {
+			t.Fatalf("four-field sort err = %v, want ErrNotSupported", err)
+		}
+		if _, err = searcher.Search(context.Background(), SearchRequest{
+			Q: "*", SortBy: []SortField{{Field: "id"}}, Limit: 1,
+		}); !errors.Is(err, ErrUnsafeValue) {
+			t.Fatalf("id sort err = %v, want ErrUnsafeValue", err)
+		}
+
+		// A structured query with no explicit order uses the server's real
+		// default_sorting_field, not a fabricated id order.
+		q := dal.From(dal.NewRootCollectionRef("books", "")).NewQuery().
+			Limit(12).SelectIntoRecord(nil)
+		reader, err := pureDB.ExecuteQueryToRecordsReader(context.Background(), q)
+		if err != nil {
+			t.Fatalf("default-sort reader: %v", err)
+		}
+		var defaultIDs []string
+		var defaultRanks []int64
+		for {
+			rec, nextErr := reader.Next()
+			if errors.Is(nextErr, dal.ErrNoMoreRecords) {
+				break
+			}
+			if nextErr != nil {
+				t.Fatalf("default-sort Next: %v", nextErr)
+			}
+			defaultIDs = append(defaultIDs, rec.Key().ID.(string))
+			defaultRanks = append(defaultRanks, rec.Data().(map[string]any)["rank"].(int64))
+		}
+		_ = reader.Close()
+		if len(defaultIDs) != 12 || defaultIDs[0] != "012" {
+			t.Fatalf("structured default-sort ids = %v", defaultIDs)
+		}
+		if !equalInt64s(defaultRanks, wantRanks) {
+			t.Fatalf("structured default-sort ranks = %v, want %v", defaultRanks, wantRanks)
+		}
+	})
+
 	t.Run("native-offset-at-or-beyond-found", func(t *testing.T) {
 		searcher, _ := dal.As[NativeSearcher](pagingDB)
 		for _, tc := range []struct {
@@ -674,6 +765,47 @@ func hitIDs(hits []SearchHit) []string {
 		ids = append(ids, hit.ID)
 	}
 	return ids
+}
+
+func documentRanks(t *testing.T, hits []SearchHit) []int64 {
+	t.Helper()
+	ranks := make([]int64, len(hits))
+	for index, hit := range hits {
+		rank, ok := hit.Document["rank"].(int64)
+		if !ok {
+			t.Fatalf("hit %q rank = %#v (%T), want int64", hit.ID, hit.Document["rank"], hit.Document["rank"])
+		}
+		ranks[index] = rank
+	}
+	return ranks
+}
+
+func equalInt64s(got, want []int64) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index] != want[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func assertIDSet(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("ids = %v, want %v", got, want)
+	}
+	seen := make(map[string]bool, len(got))
+	for _, id := range got {
+		seen[id] = true
+	}
+	for _, id := range want {
+		if !seen[id] {
+			t.Fatalf("ids = %v, want %v", got, want)
+		}
+	}
 }
 
 func containsID(ids []string, want string) bool {
