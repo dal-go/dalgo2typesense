@@ -292,18 +292,23 @@ func (e collectionEntry) definition() *dbschema.CollectionDef {
 	columns := make([]dbschema.SourceColumnDef, 0, len(e.Fields)+1)
 	declaredID := false
 	for _, field := range e.Fields {
+		nullable := field.Optional
 		if field.Name == nativeIDField {
 			declaredID = true
+			// Typesense always returns the id string and assigns one when it
+			// is omitted, so the built-in identity is never nullable even
+			// when the declared metadata marks it optional.
+			nullable = false
 		}
 		fields = append(fields, dbschema.FieldDef{
 			Name:     dal.FieldName(field.Name),
 			Type:     portableType(field.Type),
-			Nullable: field.Optional,
+			Nullable: nullable,
 		})
 		columns = append(columns, dbschema.SourceColumnDef{
 			Name:         field.Name,
 			DeclaredType: field.Type,
-			NotNull:      !field.Optional,
+			NotNull:      !nullable,
 		})
 	}
 	if !declaredID {
