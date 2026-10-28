@@ -445,10 +445,19 @@ func TestNumeric_ExactDecimalInteger(t *testing.T) {
 		{name: "fraction", text: "1.5", want: 1.5},
 		{name: "small-fraction", text: "0.1", want: 0.1},
 		{name: "negative-zero", text: "-0.0", want: int64(0)},
+		{name: "zero", text: "0", want: int64(0)},
+		{name: "leading-zero-fraction", text: "0.5", want: 0.5},
+		{name: "positive-exponent-sign", text: "1e+2", want: int64(100)},
+		{name: "negative-exponent", text: "1e-2", want: 0.01},
 		{name: "empty", text: "", wantErr: true},
 		{name: "not-a-number", text: "abc", wantErr: true},
 		{name: "double-dot", text: "1.2.3", wantErr: true},
 		{name: "empty-exponent", text: "1e", wantErr: true},
+		{name: "trailing-dot", text: "1.", wantErr: true},
+		{name: "leading-dot", text: ".1", wantErr: true},
+		{name: "leading-zero", text: "01", wantErr: true},
+		{name: "negative-leading-zero", text: "-01", wantErr: true},
+		{name: "double-leading-zero", text: "00", wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := convertJSONNumber(json.Number(tc.text))
@@ -483,10 +492,19 @@ func TestNumeric_FormatJSONNumber(t *testing.T) {
 		{name: "decimal-short", text: "1.0", want: "1"},
 		{name: "fraction", text: "1.5", want: "1.5"},
 		{name: "negative-zero", text: "-0.0", want: "0"},
+		{name: "zero", text: "0", want: "0"},
+		{name: "leading-zero-fraction", text: "0.5", want: "0.5"},
+		{name: "positive-exponent-sign", text: "1e+2", want: "100"},
+		{name: "negative-exponent", text: "1e-2", want: "0.01"},
 		{name: "uint64-beyond-typesense-int64", text: "18446744073709551615e0", wantErr: true},
 		{name: "uint64-overflow", text: "18446744073709551616e0", wantErr: true},
 		{name: "invalid", text: "abc", wantErr: true},
 		{name: "float-overflow", text: "1e400", wantErr: true},
+		{name: "trailing-dot", text: "1.", wantErr: true},
+		{name: "leading-dot", text: ".1", wantErr: true},
+		{name: "leading-zero", text: "01", wantErr: true},
+		{name: "negative-leading-zero", text: "-01", wantErr: true},
+		{name: "double-leading-zero", text: "00", wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, class, err := formatJSONNumber(json.Number(tc.text))

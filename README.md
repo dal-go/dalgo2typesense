@@ -105,6 +105,9 @@ collections, keys or documents.
   outside those ranges is rejected, never silently substituted. Only
   non-integral values become finite `float64` values with documented IEEE754
   semantics.
+* A caller-supplied `json.Number` must use a valid JSON number spelling.
+  Malformed forms such as `1.`, `.1` and `01` are refused rather than
+  normalised.
 * Facet stats keep the exact native JSON class too: an integral `min`, `max`,
   `sum` or `avg` is `int64`/`uint64`, a fractional one is `float64`. They stay
   native Typesense facet statistics, not SQL aggregates.

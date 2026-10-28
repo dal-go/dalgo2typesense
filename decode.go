@@ -185,10 +185,12 @@ func convertJSONNumber(number json.Number) (any, error) {
 }
 
 // exactDecimalInteger decides the exact integral value of a JSON number text.
-// It accepts every spelling JSON allows, including exponents and a decimal
-// point, and never converts through float64. For example 9007199254740993e0
-// and 9007199254740993.0 both stay exactly 9007199254740993, while the same
-// value written as a float would round to 9007199254740992.
+// It accepts the JSON number grammar, including exponents and a decimal point,
+// and never converts through float64. For example 9007199254740993e0 and
+// 9007199254740993.0 both stay exactly 9007199254740993, while the same value
+// written as a float would round to 9007199254740992. Spellings that the JSON
+// grammar does not allow, such as 1., .1 or 01, are rejected instead of being
+// silently normalised.
 //
 // integral is false when the value is finite but not an integer; the caller may
 // then apply documented IEEE754 float64 semantics. err reports invalid syntax or
@@ -232,11 +234,26 @@ func exactDecimalInteger(text string) (value any, integral bool, err error) {
 		if strings.IndexByte(mantissa[dot+1:], '.') >= 0 {
 			return nil, false, malformed("JSON number is not valid")
 		}
-		fractionLength = len(mantissa) - dot - 1
-		mantissa = mantissa[:dot] + mantissa[dot+1:]
-	}
-	if !isDecimalDigits(mantissa) {
-		return nil, false, malformed("JSON number is not valid")
+		integerPart := mantissa[:dot]
+		fractionPart := mantissa[dot+1:]
+		// JSON requires digits on both sides of the decimal point and forbids
+		// leading zeroes in the integer part, so 1., .1 and 01 are malformed
+		// rather than normalised input.
+		if !isDecimalDigits(integerPart) || !isDecimalDigits(fractionPart) {
+			return nil, false, malformed("JSON number is not valid")
+		}
+		if len(integerPart) > 1 && integerPart[0] == '0' {
+			return nil, false, malformed("JSON number has a leading zero")
+		}
+		fractionLength = len(fractionPart)
+		mantissa = integerPart + fractionPart
+	} else {
+		if !isDecimalDigits(mantissa) {
+			return nil, false, malformed("JSON number is not valid")
+		}
+		if len(mantissa) > 1 && mantissa[0] == '0' {
+			return nil, false, malformed("JSON number has a leading zero")
+		}
 	}
 	digits := strings.TrimLeft(mantissa, "0")
 	if digits == "" {
