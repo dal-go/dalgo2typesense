@@ -645,6 +645,28 @@ func TestNumeric_FilterKeepsIntegralExponent(t *testing.T) {
 	}
 }
 
+func TestNumeric_OutOfRangeFilterIsRefusedBeforeIO(t *testing.T) {
+	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("out-of-range filter constant performed I/O")
+	})
+	db := newTestDB(t, server, nil)
+	query := dal.From(dal.NewRootCollectionRef("books", "")).
+		NewQuery().
+		Where(dal.Comparison{
+			Left:     dal.Field("big"),
+			Operator: dal.Equal,
+			Right:    dal.Constant{Value: json.Number("18446744073709551616e0")},
+		}).
+		Limit(1).
+		SelectIntoRecord(nil)
+	if _, err := readerForQuery(t, db, query); !errors.Is(err, ErrUnsafeValue) {
+		t.Fatalf("err = %v, want ErrUnsafeValue", err)
+	}
+	if server.requests.Load() != 0 {
+		t.Fatalf("refused query performed %d I/O calls", server.requests.Load())
+	}
+}
+
 func TestNumeric_NativeFacetStatsKeepExactClasses(t *testing.T) {
 	const body = `{"found":1,"out_of":1,"page":1,"hits":[
 		{"document":{"id":"a","price":9007199254740993}}],
