@@ -157,7 +157,7 @@ func (r *recordsReader) Cursor() (string, error) {
 	if r.closed {
 		return "", dal.ErrReaderClosed
 	}
-	return "", nil
+	return "", notSupported("typesense readers do not issue cursors")
 }
 
 func (r *recordsReader) Close() error {
@@ -323,7 +323,7 @@ func (r *recordsetReader) Cursor() (string, error) {
 	if r.closed {
 		return "", dal.ErrReaderClosed
 	}
-	return "", nil
+	return "", notSupported("typesense readers do not issue cursors")
 }
 
 func (r *recordsetReader) Close() error {

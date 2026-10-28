@@ -247,6 +247,9 @@ func TestStructuredQuery_FlagsProjectionAndPaging(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExecuteQueryToRecordsReader: %v", err)
 	}
+	if _, err := reader.Cursor(); !errors.Is(err, dal.ErrNotSupported) {
+		t.Fatalf("Cursor err = %v, want ErrNotSupported", err)
+	}
 	var ids []string
 	for {
 		rec, err := reader.Next()

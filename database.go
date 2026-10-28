@@ -111,6 +111,9 @@ func (d *backend) Adapter() dal.Adapter { return dal.NewAdapter(adapterName, ada
 // The adapter does not synthesize fields from a declared schema.
 func (*backend) Schema() dal.Schema {
 	return dal.NewSchema(nil, func(incomplete *record.Key, data any) (*record.Key, error) {
+		if incomplete == nil {
+			return nil, malformed("incomplete key is required")
+		}
 		var id string
 		switch doc := data.(type) {
 		case map[string]any:

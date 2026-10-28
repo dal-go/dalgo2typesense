@@ -175,11 +175,13 @@ func TestHeadersAreRefreshedPerRequestAndUnsafeHeadersRefused(t *testing.T) {
 
 func TestCancellationAndClose(t *testing.T) {
 	started := make(chan struct{})
+	disconnected := make(chan struct{})
 	release := make(chan struct{})
 	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		close(started)
 		select {
 		case <-r.Context().Done():
+			close(disconnected)
 		case <-release:
 		}
 	})
@@ -204,6 +206,11 @@ func TestCancellationAndClose(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("canceled search did not return")
+	}
+	select {
+	case <-disconnected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not observe the client disconnect")
 	}
 	close(release)
 

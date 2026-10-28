@@ -237,6 +237,9 @@ func (d *backend) nativeQuery(request SearchRequest) (string, url.Values, error)
 		maxFacetValues := request.MaxFacetValues
 		if maxFacetValues == 0 {
 			maxFacetValues = 10
+			if d.cfg.MaxFacetValues < maxFacetValues {
+				maxFacetValues = d.cfg.MaxFacetValues
+			}
 		}
 		if maxFacetValues < 0 || maxFacetValues > d.cfg.MaxFacetValues {
 			return "", nil, notSupported("max facet values is outside the configured bound")

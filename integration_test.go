@@ -78,6 +78,15 @@ func TestTypesenseIntegration(t *testing.T) {
 		if len(collections) != 1 || collections[0].Name() != "books" {
 			t.Fatalf("collections = %+v", collections)
 		}
+		scopedDB := f.db(t, "", metadataKey)
+		scopedReader, _ := dal.As[dbschema.SchemaReader](scopedDB)
+		visible, err := scopedReader.ListCollections(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("scoped ListCollections: %v", err)
+		}
+		if len(visible) != 1 || visible[0].Name() != "books" {
+			t.Fatalf("scoped key exposed unauthorized collections: %+v", visible)
+		}
 		def, err := reader.DescribeCollection(context.Background(), ptrRef("books"))
 		if err != nil {
 			t.Fatalf("DescribeCollection: %v", err)
@@ -257,7 +266,7 @@ func TestTypesenseIntegration(t *testing.T) {
 		// The search key cannot read an unauthorized collection.
 		otherDB := f.db(t, "", searchKey)
 		otherSearcher, _ := dal.As[NativeSearcher](otherDB)
-		_, err := otherSearcher.Search(context.Background(), SearchRequest{Collection: "other", Q: "*", Limit: 1})
+		_, err := otherSearcher.Search(context.Background(), SearchRequest{Collection: "archive", Q: "*", Limit: 1})
 		if !errors.Is(err, ErrPermissionDenied) {
 			t.Fatalf("unauthorized collection err = %v", err)
 		}
@@ -473,12 +482,20 @@ func (f *fixtureEnv) seed(t *testing.T) {
 	if status, body := f.do(t, f.bootstrap, http.MethodPost, "/collections", schema); status != http.StatusCreated && status != http.StatusOK {
 		t.Fatalf("create collection: HTTP %d, %s", status, body)
 	}
+	archiveSchema := `{"name":"archive","fields":[{"name":"title","type":"string"}]}`
+	if status, body := f.do(t, f.bootstrap, http.MethodPost, "/collections", archiveSchema); status != http.StatusCreated && status != http.StatusOK {
+		t.Fatalf("create archive collection: HTTP %d, %s", status, body)
+	}
+	if status, body := f.do(t, f.bootstrap, http.MethodPost,
+		"/collections/archive/documents/import?action=upsert", `{"id":"a1","title":"Archive"}`); status != http.StatusOK || strings.Contains(body, `"success":false`) {
+		t.Fatalf("import archive: HTTP %d, %s", status, body)
+	}
 	documents := []string{
 		`{"id":"001","title":"Dune","author":"Frank Herbert","genre":"science fiction","year":1965,"rank":10,"seq":1,"big":9007199254740993,"ratio":1.5,"active":true,"tags":["classic","desert"]}`,
 		`{"id":"002","title":"Dune Messiah","author":"Frank Herbert","genre":"science fiction","year":1969,"rank":10,"seq":2,"big":-9223372036854775808,"ratio":2.25,"active":false,"tags":["sequel"]}`,
 		`{"id":"003","title":"Children of Dune","author":"Frank Herbert","genre":"science fiction","year":1976,"rank":20,"seq":3,"big":9223372036854775807,"ratio":3.5,"active":true,"tags":["sequel"],"note":"a b (c) && d"}`,
 		`{"id":"004","title":"Neuromancer","author":"William Gibson","genre":"cyberpunk","year":1984,"rank":20,"seq":4,"big":0,"ratio":4.5,"active":true,"tags":["classic"]}`,
-		`{"id":"005","title":"Foundation","author":"Isaac Asimov","genre":"science fiction","year":1951,"rank":30,"seq":5,"big":42,"ratio":1.0,"active":false,"tags":["classic"]}`,
+		`{"id":"005","title":"Foundation","author":"Isaac Asimov","genre":"science fiction","year":1951,"rank":30,"seq":5,"big":42,"ratio":1.0,"active":false,"tags":["classic"],"note":null}`,
 		`{"id":"006","title":"Snow Crash","author":"Neal Stephenson","genre":"cyberpunk","year":1992,"rank":40,"seq":6,"big":84,"ratio":2.0,"active":true,"tags":["classic"]}`,
 		`{"id":"007","title":"The Left Hand of Darkness","author":"Ursula K. Le Guin","genre":"science fiction","year":1969,"rank":50,"seq":7,"big":7,"ratio":0.5,"active":true,"tags":["classic"]}`,
 		`{"id":"008","title":"Hyperion","author":"Dan Simmons","genre":"science fiction","year":1989,"rank":60,"seq":8,"big":8,"ratio":0.25,"active":true,"tags":["classic"]}`,
