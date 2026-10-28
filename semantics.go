@@ -1,6 +1,7 @@
 package dalgo2typesense
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"math/big"
@@ -222,39 +223,70 @@ func (l filterLiteral) compareNumber(value any) (int, bool) {
 	return number.Cmp(l.number), true
 }
 
-func matchIn(fieldValue any, literals []filterLiteral) bool {
-	if elements, ok := arrayElements(fieldValue); ok {
+// observeVerifierContext reports a canonical, detail-free context failure as
+// soon as the operation is canceled or its deadline passes. The verifier calls
+// it from its inner AND/OR/IN loops and while converting an array value, so a
+// cancellation is observed during one row's exact comparison instead of only
+// between HTTP pages.
+func observeVerifierContext(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return safeContextError(ctx, err)
+	}
+	return nil
+}
+
+func matchIn(ctx context.Context, fieldValue any, literals []filterLiteral) (bool, error) {
+	elements, isArray, err := arrayElements(ctx, fieldValue)
+	if err != nil {
+		return false, err
+	}
+	if isArray {
 		for _, element := range elements {
 			for _, literal := range literals {
+				if err := observeVerifierContext(ctx); err != nil {
+					return false, err
+				}
 				if literal.equalValue(element) {
-					return true
+					return true, nil
 				}
 			}
 		}
-		return false
+		return false, nil
 	}
 	for _, literal := range literals {
+		if err := observeVerifierContext(ctx); err != nil {
+			return false, err
+		}
 		if literal.equalValue(fieldValue) {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
-func arrayElements(value any) ([]any, bool) {
+// arrayElements eagerly converts one native array value. It observes the
+// operation context on every element so a canceled read cannot spend the whole
+// bounded array budget before the cancellation is reported.
+func arrayElements(ctx context.Context, value any) ([]any, bool, error) {
 	if value == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	reflected := reflect.ValueOf(value)
 	switch reflected.Kind() {
 	case reflect.Slice, reflect.Array:
 		elements := make([]any, reflected.Len())
 		for i := 0; i < reflected.Len(); i++ {
+			if err := observeVerifierContext(ctx); err != nil {
+				return nil, false, err
+			}
 			elements[i] = reflected.Index(i).Interface()
 		}
-		return elements, true
+		return elements, true, nil
 	default:
-		return nil, false
+		return nil, false, nil
 	}
 }
 
@@ -262,7 +294,7 @@ func arrayElements(value any) ([]any, bool) {
 // admitted condition AST as the native filter. It supports only the whole
 // AND/OR tree and the scalar comparisons the compiler already admits.
 type conditionVerifier interface {
-	match(data map[string]any) (bool, error)
+	match(ctx context.Context, data map[string]any) (bool, error)
 }
 
 type groupVerifier struct {
@@ -270,11 +302,14 @@ type groupVerifier struct {
 	conditions []conditionVerifier
 }
 
-func (g groupVerifier) match(data map[string]any) (bool, error) {
+func (g groupVerifier) match(ctx context.Context, data map[string]any) (bool, error) {
 	switch g.operator {
 	case dal.And:
 		for _, condition := range g.conditions {
-			ok, err := condition.match(data)
+			if err := observeVerifierContext(ctx); err != nil {
+				return false, err
+			}
+			ok, err := condition.match(ctx, data)
 			if err != nil || !ok {
 				return false, err
 			}
@@ -282,7 +317,10 @@ func (g groupVerifier) match(data map[string]any) (bool, error) {
 		return true, nil
 	case dal.Or:
 		for _, condition := range g.conditions {
-			ok, err := condition.match(data)
+			if err := observeVerifierContext(ctx); err != nil {
+				return false, err
+			}
+			ok, err := condition.match(ctx, data)
 			if err != nil || ok {
 				return ok, err
 			}
@@ -300,7 +338,10 @@ type comparisonVerifier struct {
 	literals []filterLiteral
 }
 
-func (c comparisonVerifier) match(data map[string]any) (bool, error) {
+func (c comparisonVerifier) match(ctx context.Context, data map[string]any) (bool, error) {
+	if err := observeVerifierContext(ctx); err != nil {
+		return false, err
+	}
 	fieldValue, found := data[c.field]
 	if !found {
 		// A missing or unavailable field can never authorize a row. A true
@@ -311,7 +352,7 @@ func (c comparisonVerifier) match(data map[string]any) (bool, error) {
 	case dal.Equal:
 		return c.literal.equalValue(fieldValue), nil
 	case dal.In:
-		return matchIn(fieldValue, c.literals), nil
+		return matchIn(ctx, fieldValue, c.literals)
 	case dal.GreaterThen, dal.GreaterOrEqual, dal.LessThen, dal.LessOrEqual:
 		comparison, ok := c.literal.compareNumber(fieldValue)
 		if !ok {

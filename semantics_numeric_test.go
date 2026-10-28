@@ -73,7 +73,7 @@ func TestNumericVerifier_KeepsOriginalStrictOperator(t *testing.T) {
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
-			got, err := verifier.match(map[string]any{"n": tc.value})
+			got, err := verifier.match(context.Background(), map[string]any{"n": tc.value})
 			if err != nil {
 				t.Fatalf("match: %v", err)
 			}

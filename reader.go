@@ -237,7 +237,13 @@ func (r *recordsReader) bufferFiltered() error {
 			if r.seen[hit.ID] {
 				return ErrDuplicateID
 			}
-			ok, err := r.plan.verifier.match(hit.Document)
+			ok, err := r.plan.verifier.match(r.op.ctx, hit.Document)
+			// A cancellation or deadline observed during the exact final
+			// comparison outranks both a mismatch refusal and admission of a
+			// verified row. No candidate value is ever included in the error.
+			if ctxErr := r.op.check(); ctxErr != nil {
+				return ctxErr
+			}
 			if err != nil {
 				return err
 			}
@@ -276,6 +282,11 @@ func (r *recordsReader) bufferFiltered() error {
 	end := start + r.plan.limit
 	if end > len(verified) {
 		end = len(verified)
+	}
+	// Re-check immediately before committing the buffered page: a cancellation
+	// while the final candidate was verified must not publish any prefix.
+	if err := r.op.check(); err != nil {
+		return err
 	}
 	r.page = verified[start:end]
 	r.pos = 0

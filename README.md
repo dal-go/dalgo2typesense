@@ -87,10 +87,14 @@ small exact verifier and checks every native candidate before exposing it.
   scan.
 * Filtered reads fetch native candidates from offset zero through
   `offset+limit`, verify the complete window, and only then apply the requested
-  offset locally. A later-page mismatch cannot leave an apparently successful
-  prefix. If that window cannot fit the existing `MaxPages`,
-  `MaxRowsPerPage`, `MaxOffset`, row, byte and deadline bounds, the query is
-  refused before I/O. Unfiltered reads keep their lazy native-offset path.
+  offset locally. A later-page mismatch or a cancellation during verification
+  cannot leave an apparently successful prefix. The window shape is checked
+  before I/O: a window that cannot fit the configured `MaxPages`,
+  `MaxRowsPerPage`, `MaxOffset` or `MaxColumns` bounds is refused before any
+  request. Row and response-byte limits, the operation deadline and
+  cancellation are enforced while the window is buffered, so those refusals
+  happen during the read, before any row is exposed. Unfiltered reads keep their
+  lazy native-offset path.
 * Predicate helper fields are fetched with the declared projection so the
   verifier can see them. They count against `MaxColumns` and are stripped before
   a projected row is constructed.
