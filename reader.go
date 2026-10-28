@@ -242,7 +242,9 @@ func (r *recordsReader) bufferFiltered() error {
 				return err
 			}
 			if !ok {
-				return semanticMismatch("native filter candidate does not satisfy the exact query predicate")
+				return semanticMismatch("native filter candidate fails the exact predicate; " +
+					"string/array folding can add false positives and a widened strict numeric " +
+					"boundary candidate can be a false positive too")
 			}
 			data, err := projectedDocument(hit, r.plan)
 			if err != nil {

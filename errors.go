@@ -90,7 +90,7 @@ var (
 	// values, and the exact verifier then rejects the boundary row. It also
 	// unwraps to dal.ErrNotSupported because the adapter honestly cannot
 	// produce the requested exact result under the existing bounds.
-	ErrSemanticMismatch = errors.New("typesense: candidate does not satisfy the exact query semantics")
+	ErrSemanticMismatch = errors.New("typesense: exact structured predicate cannot be matched by the native candidate")
 )
 
 // HTTPError is a safe Typesense HTTP status error. Only the numeric status is
