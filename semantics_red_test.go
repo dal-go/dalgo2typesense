@@ -3,8 +3,10 @@ package dalgo2typesense
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/dal-go/dalgo/access"
 	"github.com/dal-go/dalgo/dal"
@@ -281,4 +283,83 @@ func TestStructuredSemantics_SecureReadSessionResidualCannotLeak(t *testing.T) {
 	}
 	defer func() { _ = reader.Close() }()
 	nextRow(t, reader)
+}
+
+// TestStructuredSemantics_LaterBufferCancellation proves a context cancelled
+// while the filtered candidate window is still being buffered stops the read
+// before any row is exposed, and that the reader still closes cleanly.
+func TestStructuredSemantics_LaterBufferCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var requests int
+	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Query().Get("offset") == "" {
+			writeJSON(t, w, http.StatusOK, `{"found":3,"out_of":3,"page":1,"hits":[
+				{"document":{"id":"a","label":"classic"}}]}`)
+			return
+		}
+		cancel()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
+	})
+	db := newTestDB(t, server, func(cfg *Config) { cfg.MaxRowsPerPage = 1 })
+	reader, err := db.ExecuteQueryToRecordsReader(ctx,
+		structuredBooksQuery(dal.Field("label").EqualTo("classic"), 3, 0))
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	if _, err = reader.Next(); !errors.Is(err, ErrCanceled) {
+		t.Fatalf("Next err = %v, want ErrCanceled during later buffer page", err)
+	}
+	if requests < 2 {
+		t.Fatalf("requests = %d, want a later buffer page to observe cancellation", requests)
+	}
+	if err = reader.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err = reader.Next(); !errors.Is(err, dal.ErrReaderClosed) {
+		t.Fatalf("Next after Close = %v, want ErrReaderClosed", err)
+	}
+}
+
+// TestStructuredSemantics_BackendCloseDuringBuffer proves closing the adapter
+// while a later buffer page is in flight also stops the read without exposing a
+// prefix.
+func TestStructuredSemantics_BackendCloseDuringBuffer(t *testing.T) {
+	var requests int
+	var db dal.DB
+	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Query().Get("offset") == "" {
+			writeJSON(t, w, http.StatusOK, `{"found":3,"out_of":3,"page":1,"hits":[
+				{"document":{"id":"a","label":"classic"}}]}`)
+			return
+		}
+		closer, ok := dal.As[io.Closer](db)
+		if !ok {
+			t.Error("test DB does not expose io.Closer")
+			return
+		}
+		_ = closer.Close()
+		writeJSON(t, w, http.StatusOK, `{"found":3,"out_of":3,"page":1,"hits":[
+			{"document":{"id":"b","label":"classic"}}]}`)
+	})
+	db = newTestDB(t, server, func(cfg *Config) { cfg.MaxRowsPerPage = 1 })
+	reader, err := db.ExecuteQueryToRecordsReader(context.Background(),
+		structuredBooksQuery(dal.Field("label").EqualTo("classic"), 3, 0))
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	if _, err = reader.Next(); !errors.Is(err, ErrCanceled) {
+		t.Fatalf("Next err = %v, want ErrCanceled after backend Close", err)
+	}
+	if requests < 2 {
+		t.Fatalf("requests = %d, want a later buffer page", requests)
+	}
+	if err = reader.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 }

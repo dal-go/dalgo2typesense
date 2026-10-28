@@ -56,6 +56,12 @@ func TestTypesenseIntegration(t *testing.T) {
 	pagingDB := f.dbWithConfig(t, "books", searchKey, func(cfg *Config) {
 		cfg.MaxRowsPerPage = 3
 	})
+	semanticsKey := f.createKeyForCollections(t, "semantics-search", []string{"documents:search"}, []string{"semantics"})
+	semanticsDB := f.db(t, "semantics", semanticsKey)
+
+	t.Run("structured-exact-semantics", func(t *testing.T) {
+		runSemanticIntegration(t, f, semanticsDB, semanticsKey)
+	})
 
 	t.Run("pure-search-key-works-without-metadata", func(t *testing.T) {
 		searcher, _ := dal.As[NativeSearcher](pureDB)
@@ -822,6 +828,19 @@ func (f *fixtureEnv) seed(t *testing.T) {
 	if status, body := f.do(t, f.bootstrap, http.MethodPost, "/collections", archiveSchema); status != http.StatusCreated && status != http.StatusOK {
 		t.Fatalf("create archive collection: HTTP %d, %s", status, body)
 	}
+	semanticsSchema := `{
+		"name":"semantics",
+		"fields":[
+			{"name":"label","type":"string","facet":true},
+			{"name":"tags","type":"string[]","facet":true,"optional":true},
+			{"name":"note","type":"string","optional":true},
+			{"name":"n","type":"float"},
+			{"name":"m","type":"int32","sort":true}
+		]
+	}`
+	if status, body := f.do(t, f.bootstrap, http.MethodPost, "/collections", semanticsSchema); status != http.StatusCreated && status != http.StatusOK {
+		t.Fatalf("create semantics collection: HTTP %d, %s", status, body)
+	}
 	if status, body := f.do(t, f.bootstrap, http.MethodPost,
 		"/collections/archive/documents/import?action=upsert", `{"id":"a1","title":"Archive"}`); status != http.StatusOK || strings.Contains(body, `"success":false`) {
 		t.Fatalf("import archive: HTTP %d, %s", status, body)
@@ -846,6 +865,29 @@ func (f *fixtureEnv) seed(t *testing.T) {
 		t.Fatalf("import documents: HTTP %d, %s", status, body)
 	}
 
+	// The semantics collection is the real 30.2 evidence set for exact
+	// predicate verification. n keeps the observed FLOAT quantisation cases
+	// (strict > / < omit strict-eligible raw values), m is a sortable int32
+	// with known exact boundaries, and the labels exercise case, accent,
+	// punctuation and whitespace folding.
+	semanticsDocuments := []string{
+		`{"id":"f0","label":"classic","tags":["classic","desert"],"n":0.1,"m":4}`,
+		`{"id":"f1","label":"Classic","tags":["sequel"],"n":0.1000000001,"m":6}`,
+		`{"id":"f2","label":"CLASSIC","tags":["classic"],"n":0.10000000149,"m":7}`,
+		`{"id":"f3","label":"red-blue","tags":["a_b"],"n":100000001,"m":9}`,
+		`{"id":"f4","label":"redblue","tags":["ab"],"n":100000000,"m":10}`,
+		`{"id":"f5","label":"café","n":1.5,"m":12}`,
+		`{"id":"f6","label":"cafe","n":2.5,"m":13}`,
+		`{"id":"f7","label":"a.b","tags":["ab"],"n":3.5,"m":14}`,
+		`{"id":"f8","label":"ab","tags":["a_b"],"n":4.5,"m":15}`,
+		`{"id":"f9","label":"hello world","n":5.5,"m":16}`,
+		`{"id":"f10","label":"hello  world","n":6.5,"m":17}`,
+	}
+	if status, body = f.do(t, f.bootstrap, http.MethodPost,
+		"/collections/semantics/documents/import?action=upsert", strings.Join(semanticsDocuments, "\n")); status != http.StatusOK || strings.Contains(body, `"success":false`) {
+		t.Fatalf("import semantics documents: HTTP %d, %s", status, body)
+	}
+
 	curation := `{"items":[{
 		"id":"pin-scifi-doc",
 		"rule":{"filter_by":"genre:=cyberpunk"},
@@ -861,10 +903,15 @@ func (f *fixtureEnv) seed(t *testing.T) {
 
 func (f *fixtureEnv) createKey(t *testing.T, description string, actions []string) string {
 	t.Helper()
+	return f.createKeyForCollections(t, description, actions, []string{"books"})
+}
+
+func (f *fixtureEnv) createKeyForCollections(t *testing.T, description string, actions, collections []string) string {
+	t.Helper()
 	body, err := json.Marshal(map[string]any{
 		"description": description,
 		"actions":     actions,
-		"collections": []string{"books"},
+		"collections": collections,
 	})
 	if err != nil {
 		t.Fatalf("marshal key: %v", err)

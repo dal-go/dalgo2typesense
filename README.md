@@ -67,6 +67,52 @@ Structured queries are not text searches. They explicitly send
 `typo_tokens_threshold=0` in addition to `q=*`. Native `Q` keeps the server's
 honest typo, prefix and token-dropping semantics.
 
+### Exact structured predicates and honest refusal
+
+A native Typesense `filter_by` is only a **bounded candidate producer**. Typesense
+filtering folds case, accents, punctuation and whitespace, matches array elements
+for scalar filters, and can return rows that the admitted DALgo predicate does not
+actually satisfy. The adapter therefore compiles the same condition AST into a
+small exact verifier and checks every native candidate before exposing it.
+
+* The whole `AND`/`OR` tree is evaluated exactly. Scalar `Equal` and numeric
+  ranges are scalar-only: an array value is not equal to a scalar and is not a
+  numeric range. `In` intentionally matches an exact array element.
+* A missing predicate field never authorizes a row by itself. A true sibling
+  `OR` branch can still make the whole predicate true.
+* If any real candidate fails the exact predicate, the read is refused with
+  `ErrSemanticMismatch` (which also unwraps to `dal.ErrNotSupported`) **before
+  the first row is exposed**. There is no silent row dropping, no
+  scan-around retry, no automatic policy relaxation and no broad whole-collection
+  scan.
+* Filtered reads fetch native candidates from offset zero through
+  `offset+limit`, verify the complete window, and only then apply the requested
+  offset locally. A later-page mismatch cannot leave an apparently successful
+  prefix. If that window cannot fit the existing `MaxPages`,
+  `MaxRowsPerPage`, `MaxOffset`, row, byte and deadline bounds, the query is
+  refused before I/O. Unfiltered reads keep their lazy native-offset path.
+* Predicate helper fields are fetched with the declared projection so the
+  verifier can see them. They count against `MaxColumns` and are stripped before
+  a projected row is constructed.
+* Structured `NOT IN` is refused before I/O because native negative string
+  folding is not a safe superset. `NativeSearcher` keeps its native negative
+  filter grammar.
+
+**Numeric candidate widening (documented limitation).** Typesense 30.2 stores
+raw JSON numbers but indexes `float` values through quantised buckets. An actual
+probe showed strict `n:>0.1` omitting stored `0.1000000001` and
+`0.10000000149`, and `n:>100000000` returning nothing even though `100000001`
+is stored. A strict native filter alone therefore cannot be trusted to contain
+every eligible row. The adapter lowers structured strict `>` and `<` candidates
+to inclusive `>=` and `<=`; existing `>=` and `<=` are unchanged. The exact
+verifier still evaluates the **original** operator and the **same** compiler wire
+literal, so an inclusive boundary candidate is refused rather than silently
+dropped. This means an exact integer boundary (for example `year > 1965` when a
+row has `1965`) can refuse the read, and a fractional RHS on an integer field may
+be rejected by the server. That is an intentional, fail-closed initial
+limitation, not a bypass. `NativeSearcher` remains fully engine-native.
+
+
 ### Curation and filter safety
 
 Every read path sets:
@@ -108,6 +154,13 @@ collections, keys or documents.
 * A caller-supplied `json.Number` must use a valid JSON number spelling.
   Malformed forms such as `1.`, `.1` and `01` are refused rather than
   normalised.
+* Structured numeric comparison reuses the exact wire literal the native filter
+  was built from. A `float32` RHS is compared as its shortest `float32` wire
+  decimal (for example `0.1`), never as the extra binary64 digits of
+  `float64(float32(v))`. Integral `json.Number` spellings incl. exponents stay
+  exact `int64`/`uint64`; fractional values use the documented finite IEEE754
+  value. Comparisons use exact rational arithmetic, so adjacent `int64`/`uint64`
+  values above 2^53 stay distinct and are never routed through `float64`.
 * Facet stats keep the exact native JSON class too: an integral `min`, `max`,
   `sum` or `avg` is `int64`/`uint64`, a fractional one is `float64`. They stay
   native Typesense facet statistics, not SQL aggregates.
@@ -184,6 +237,9 @@ redirect refusal, strict response shape, projection, paging, partial results,
 `search_cutoff` refusal, offset-at-or-beyond-found EOF, row and page budgets,
 exact exponent/decimal integer fidelity across readers, recordsets, filters and
 native facet stats, metadata refusal, cancellation, close and exact-id reads.
+They also pin the exact structured predicate verifier, filtered-window buffering,
+numeric candidate widening, float32 wire canonicalisation and adjacent large
+integers.
 
 The integration suite starts one owned, pinned
 `typesense/typesense:30.2@sha256:610f2d34b1f93d00762869da2c67736775e5798d19a2c8b91b014b8a0cc1e110`
@@ -192,3 +248,8 @@ that promotes a document excluded by a filter, and proves the unprotected
 server premise and the adapter's red-to-green filter enforcement. It also
 exercises multi-page reads plus an offset at and beyond the real server's found
 count, and proves the configured page and row budgets against that server.
+The same fixture seeds the observed FLOAT boundary values and proves that every
+strict-eligible raw value appears in the inclusive candidate set, that a
+boundary candidate refuses before the first row, and that exact integer, string,
+array, `AND`/`OR`, filtered-offset and `SecureReadSession` residual cases behave
+as documented.

@@ -84,9 +84,12 @@ var (
 	// satisfy the exact admitted DALgo predicate. Native string folding and
 	// array matching make filter_by a candidate producer, never the final
 	// semantic authority; such a candidate is refused instead of silently
-	// dropped, exposed or retried around. It also unwraps to
-	// dal.ErrNotSupported because the adapter honestly cannot produce the
-	// requested exact result under the existing bounds.
+	// dropped, exposed or retried around. The same refusal covers a widened
+	// strict numeric boundary candidate: a strict > or < is lowered to an
+	// inclusive >= or <= so a quantised FLOAT index cannot omit eligible raw
+	// values, and the exact verifier then rejects the boundary row. It also
+	// unwraps to dal.ErrNotSupported because the adapter honestly cannot
+	// produce the requested exact result under the existing bounds.
 	ErrSemanticMismatch = errors.New("typesense: candidate does not satisfy the exact query semantics")
 )
 
