@@ -28,7 +28,7 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
         with:
-          version: v2.13.2
+          version: v2.15.0
 
   fixture:
     name: Real Typesense 30.2 fixture
